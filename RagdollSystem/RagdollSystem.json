@@ -1,0 +1,16 @@
+{
+    "Name": "Ragdoll System",
+    "Author": "zysilm",
+    "Punchline": "Ragdoll physics on character death.",
+    "Description": "Applies ragdoll physics to characters when they die in-game. Features per-bone physics configuration, hair physics simulation, terrain collision, and optional NPC death ragdoll support. Non-humanoid NPCs are handled gracefully with automatic bone-set detection.",
+    "RepoUrl": "https://github.com/zysilm/RagdollSystem",
+    "Tags": [
+        "ragdoll",
+        "physics",
+        "death"
+    ],
+    "CategoryTags": [
+        "other"
+    ],
+    "LoadPriority": 0
+}

@@ -1,0 +1,63 @@
+name: Release Plugin
+
+on:
+  push:
+    branches: [main]
+
+env:
+  PLUGIN_NAME: RagdollSystem
+  SOLUTION_DIR: RagdollSystem
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Setup Dalamud
+        run: |
+          mkdir -p $HOME/dalamud
+          wget -q https://goatcorp.github.io/dalamud-distrib/latest.zip -O /tmp/dalamud.zip
+          unzip -o /tmp/dalamud.zip -d $HOME/dalamud
+
+      - name: Build
+        run: dotnet build ${{ env.SOLUTION_DIR }}/${{ env.PLUGIN_NAME }}.csproj -c Release
+        env:
+          DALAMUD_HOME: /home/runner/dalamud
+
+      - name: Extract version
+        id: version
+        run: |
+          ver=$(grep -oP '(?<=<Version>).*(?=</Version>)' ${{ env.SOLUTION_DIR }}/${{ env.PLUGIN_NAME }}.csproj)
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare release artifacts
+        run: |
+          sdk_zip="${{ env.SOLUTION_DIR }}/bin/Release/${{ env.PLUGIN_NAME }}/latest.zip"
+          echo "SDK zip: $sdk_zip"
+          mkdir -p release
+          unzip -o "$sdk_zip" -d release/
+          rm -f release/${{ env.PLUGIN_NAME }}.zip
+          cd release && zip -r ../${{ env.PLUGIN_NAME }}.zip .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PLUGIN_NAME }}
+          path: release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: ${{ env.PLUGIN_NAME }} v${{ steps.version.outputs.version }}
+          files: ${{ env.PLUGIN_NAME }}.zip
+          generate_release_notes: true

@@ -231,7 +231,7 @@ public sealed class RagdollSystemPlugin : IDalamudPlugin
         npcRagdollTimers.Clear();
     }
 
-    private void OnTerritoryChanged(ushort territoryId)
+    private void OnTerritoryChanged(uint territoryId)
     {
         log.Info($"Territory changed to {territoryId} — deactivating all ragdolls.");
         DeactivateAll();

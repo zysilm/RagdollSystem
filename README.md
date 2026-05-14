@@ -1,6 +1,6 @@
 # Ragdoll System
 
-A [Dalamud](https://github.com/goatcorp/Dalamud) plugin for FFXIV that applies ragdoll physics to characters when they die in-game. Bodies collapse under gravity, joints respect rotation limits, and the result settles against the terrain.
+A [Dalamud](https://github.com/goatcorp/Dalamud) plugin for FFXIV that applies ragdoll physics to characters / enemies (including monsters) when they die in-game. Bodies collapse under gravity, joints respect rotation limits, and the result settles against the terrain.
 
 This is a standalone extraction of the ragdoll subsystem from [FFXIV-CombatSimulator](https://github.com/zysilm/FFXIV-CombatSimulator) — useful on its own if you don't want the combat simulation features.
 

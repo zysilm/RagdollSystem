@@ -65,7 +65,7 @@ The build output lives at `RagdollSystem/bin/Release/RagdollSystem/`. The `relea
 
 ## Relationship to FFXIV-CombatSimulator
 
-[FFXIV-CombatSimulator](https://github.com/zysilm/FFXIV-CombatSimulator) bundles this ragdoll system as one feature among combat simulation, NPC AI, and camera controls. Ragdoll System is the same physics core extracted into a standalone plugin so users who only want death physics don't need the full combat simulator installed. The two can coexist; if you have Combat Simulator installed, you don't also need Ragdoll System.
+[FFXIV-CombatSimulator](https://github.com/zysilm/FFXIV-CombatSimulator) bundles this ragdoll system as one feature among combat simulation, NPC AI, and camera controls. Ragdoll System is the same physics core extracted into a standalone plugin so users who only want death physics don't need the full combat simulator installed. The two can coexist.
 
 ## Credits
 

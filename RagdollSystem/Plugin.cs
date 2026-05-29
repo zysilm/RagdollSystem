@@ -5,9 +5,11 @@ using RagdollSystem.Animation;
 using RagdollSystem.Core;
 using RagdollSystem.Game;
 using RagdollSystem.Gui;
+using RagdollSystem.Safety;
 using Dalamud.Game.Command;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
+using FFXIVClientStructs.FFXIV.Client.Game.Character;
 
 namespace RagdollSystem;
 
@@ -19,13 +21,16 @@ public sealed class RagdollSystemPlugin : IDalamudPlugin
     private readonly ICommandManager commandManager;
     private readonly IClientState clientState;
     private readonly IFramework framework;
+    private readonly IGameGui gameGui;
     private readonly IChatGui chatGui;
     private readonly IPluginLog log;
 
     private readonly Configuration config;
     private readonly BoneTransformService boneTransformService;
+    private readonly MovementBlockHook movementBlockHook;
     private readonly DeathDetector deathDetector;
     private readonly MainWindow mainWindow;
+    private readonly RagdollDebugOverlay debugOverlay;
 
     // Player ragdoll controller (single instance)
     private RagdollController? playerRagdoll;
@@ -52,6 +57,7 @@ public sealed class RagdollSystemPlugin : IDalamudPlugin
         this.commandManager = commandManager;
         this.clientState = clientState;
         this.framework = framework;
+        this.gameGui = gameGui;
         this.chatGui = chatGui;
         this.log = log;
 
@@ -62,9 +68,11 @@ public sealed class RagdollSystemPlugin : IDalamudPlugin
         config.Initialize(pluginInterface);
 
         boneTransformService = new BoneTransformService(gameInterop, sigScanner, log);
+        movementBlockHook = new MovementBlockHook(gameInterop, log);
         deathDetector = new DeathDetector(clientState, objectTable, log);
 
         mainWindow = new MainWindow(config, this, clientState, log);
+        debugOverlay = new RagdollDebugOverlay(this, mainWindow, config, gameGui);
 
         // Wire death events
         deathDetector.OnPlayerDeath += OnPlayerDeath;
@@ -106,6 +114,7 @@ public sealed class RagdollSystemPlugin : IDalamudPlugin
 
         deathDetector.Dispose();
         mainWindow.Dispose();
+        movementBlockHook.Dispose();
         boneTransformService.Dispose();
 
         log.Info("Ragdoll System unloaded.");
@@ -121,6 +130,7 @@ public sealed class RagdollSystemPlugin : IDalamudPlugin
     {
         if (config.ShowMainWindow)
             mainWindow.Draw();
+        debugOverlay.Draw();
     }
 
     private void OnOpenMainUi()
@@ -175,17 +185,17 @@ public sealed class RagdollSystemPlugin : IDalamudPlugin
         log.Info($"Ragdoll: Player death detected, activating ragdoll");
 
         playerRagdoll?.Dispose();
-        playerRagdoll = new RagdollController(boneTransformService, config, log);
+        playerRagdoll = new RagdollController(boneTransformService, movementBlockHook, config, log);
         playerRagdoll.Activate(address);
     }
 
     private void OnPlayerRevive(nint address)
     {
-        if (playerRagdoll == null) return;
-
         log.Info($"Ragdoll: Player revived, deactivating ragdoll");
-        playerRagdoll.Dispose();
+        playerRagdoll?.Dispose();
         playerRagdoll = null;
+        movementBlockHook.Reset();
+        RestoreCharacterMotion(address);
     }
 
     private void OnNpcDeath(nint address, uint gameObjectId)
@@ -224,6 +234,7 @@ public sealed class RagdollSystemPlugin : IDalamudPlugin
     {
         playerRagdoll?.Dispose();
         playerRagdoll = null;
+        movementBlockHook.Reset();
 
         foreach (var controller in npcRagdolls.Values)
             controller.Dispose();
@@ -245,14 +256,31 @@ public sealed class RagdollSystemPlugin : IDalamudPlugin
         if (player == null) return;
 
         playerRagdoll?.Dispose();
-        playerRagdoll = new RagdollController(boneTransformService, config, log);
+        playerRagdoll = new RagdollController(boneTransformService, movementBlockHook, config, log);
         playerRagdoll.Activate(player.Address);
     }
 
     /// <summary>Manually deactivate player ragdoll.</summary>
     public void ManualDeactivatePlayer()
     {
+        var address = Core.Services.ObjectTable.LocalPlayer?.Address ?? nint.Zero;
         playerRagdoll?.Dispose();
         playerRagdoll = null;
+        movementBlockHook.Reset();
+        RestoreCharacterMotion(address);
+    }
+
+    private unsafe void RestoreCharacterMotion(nint address)
+    {
+        if (address == nint.Zero) return;
+        try
+        {
+            var character = (Character*)address;
+            character->Timeline.OverallSpeed = 1.0f;
+        }
+        catch (Exception ex)
+        {
+            log.Warning(ex, "Failed to force-restore character motion");
+        }
     }
 }

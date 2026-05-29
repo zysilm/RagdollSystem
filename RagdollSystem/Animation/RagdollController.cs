@@ -7,9 +7,12 @@ using BepuPhysics.CollisionDetection;
 using BepuPhysics.Constraints;
 using BepuUtilities;
 using BepuUtilities.Memory;
+using Dalamud.Game.ClientState.Objects.Enums;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using FFXIVClientStructs.FFXIV.Common.Component.BGCollision;
+using RagdollSystem.Core;
+using RagdollSystem.Safety;
 using BepuSimulation = BepuPhysics.Simulation;
 
 namespace RagdollSystem.Animation;
@@ -17,6 +20,7 @@ namespace RagdollSystem.Animation;
 public unsafe class RagdollController : IDisposable
 {
     private readonly BoneTransformService boneService;
+    private readonly MovementBlockHook? movementBlockHook;
     private readonly Configuration config;
     private readonly IPluginLog log;
 
@@ -27,6 +31,8 @@ public unsafe class RagdollController : IDisposable
     // State
     private bool isActive;
     private nint targetCharacterAddress;
+    private Vector3 savedCharacterPosition;
+    private bool followWasActive;
     private float elapsed;
     private float activationDelay;
     private bool physicsStarted;
@@ -56,6 +62,10 @@ public unsafe class RagdollController : IDisposable
     private int kaoBodyBoneIndex = -1;
     // Hair physics simulator
     private HairPhysicsSimulator? hairPhysics;
+
+    // NPC bone collision - per-bone static capsules for nearby battle NPCs.
+    private readonly List<NpcCollisionState> npcCollisionStates = new();
+    private TypedIndex npcFallbackShapeIndex;
 
     public bool IsActive => isActive;
     public nint TargetCharacterAddress => targetCharacterAddress;
@@ -138,18 +148,18 @@ public unsafe class RagdollController : IDisposable
         new RagdollBoneConfig { Name = "j_sk_f_a_r", SkeletonParent = "j_sebo_a", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 0, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Front A R" },
         new RagdollBoneConfig { Name = "j_sk_s_a_l", SkeletonParent = "j_sebo_a", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 0, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Side A L" },
         new RagdollBoneConfig { Name = "j_sk_s_a_r", SkeletonParent = "j_sebo_a", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 0, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Side A R" },
-        new RagdollBoneConfig { Name = "j_sk_b_b_l", SkeletonParent = "j_sebo_b", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 0, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Back B L" },
-        new RagdollBoneConfig { Name = "j_sk_b_b_r", SkeletonParent = "j_sebo_b", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 0, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Back B R" },
-        new RagdollBoneConfig { Name = "j_sk_f_b_l", SkeletonParent = "j_sebo_b", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 0, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Front B L" },
-        new RagdollBoneConfig { Name = "j_sk_f_b_r", SkeletonParent = "j_sebo_b", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 0, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Front B R" },
-        new RagdollBoneConfig { Name = "j_sk_s_b_l", SkeletonParent = "j_sebo_b", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 0, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Side B L" },
-        new RagdollBoneConfig { Name = "j_sk_s_b_r", SkeletonParent = "j_sebo_b", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 0, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Side B R" },
-        new RagdollBoneConfig { Name = "j_sk_b_c_l", SkeletonParent = "j_sebo_c", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 0, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Back C L" },
-        new RagdollBoneConfig { Name = "j_sk_b_c_r", SkeletonParent = "j_sebo_c", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 0, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Back C R" },
-        new RagdollBoneConfig { Name = "j_sk_f_c_l", SkeletonParent = "j_sebo_c", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 0, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Front C L" },
-        new RagdollBoneConfig { Name = "j_sk_f_c_r", SkeletonParent = "j_sebo_c", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 0, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Front C R" },
-        new RagdollBoneConfig { Name = "j_sk_s_c_l", SkeletonParent = "j_sebo_c", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 0, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Side C L" },
-        new RagdollBoneConfig { Name = "j_sk_s_c_r", SkeletonParent = "j_sebo_c", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 0, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Side C R" },
+        new RagdollBoneConfig { Name = "j_sk_b_b_l", SkeletonParent = "j_sk_b_a_l", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 0, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Back B L" },
+        new RagdollBoneConfig { Name = "j_sk_b_b_r", SkeletonParent = "j_sk_b_a_r", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 0, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Back B R" },
+        new RagdollBoneConfig { Name = "j_sk_f_b_l", SkeletonParent = "j_sk_f_a_l", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 0, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Front B L" },
+        new RagdollBoneConfig { Name = "j_sk_f_b_r", SkeletonParent = "j_sk_f_a_r", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 0, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Front B R" },
+        new RagdollBoneConfig { Name = "j_sk_s_b_l", SkeletonParent = "j_sk_s_a_l", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 0, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Side B L" },
+        new RagdollBoneConfig { Name = "j_sk_s_b_r", SkeletonParent = "j_sk_s_a_r", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 0, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Side B R" },
+        new RagdollBoneConfig { Name = "j_sk_b_c_l", SkeletonParent = "j_sk_b_b_l", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 1, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Back C L" },
+        new RagdollBoneConfig { Name = "j_sk_b_c_r", SkeletonParent = "j_sk_b_b_r", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 1, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Back C R" },
+        new RagdollBoneConfig { Name = "j_sk_f_c_l", SkeletonParent = "j_sk_f_b_l", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 1, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Front C L" },
+        new RagdollBoneConfig { Name = "j_sk_f_c_r", SkeletonParent = "j_sk_f_b_r", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 1, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Front C R" },
+        new RagdollBoneConfig { Name = "j_sk_s_c_l", SkeletonParent = "j_sk_s_b_l", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 1, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Side C L" },
+        new RagdollBoneConfig { Name = "j_sk_s_c_r", SkeletonParent = "j_sk_s_b_r", Enabled = true,  CapsuleRadius = 0.01f,  CapsuleHalfLength = 0.03f, Mass = 0.1f,  SwingLimit = 0.3f,  JointType = 1, TwistMinAngle = -0.2f,  TwistMaxAngle = 0.2f,  Description = "Cloth Side C R" },
 
         // === WEAPON HOLSTER/SHEATHE === (disabled by default)
         new RagdollBoneConfig { Name = "j_buki_kosi_l",  SkeletonParent = "j_kosi",   Enabled = false, CapsuleRadius = 0.02f,  CapsuleHalfLength = 0.03f, Mass = 1.5f,  SwingLimit = 0.1f,  JointType = 0, TwistMinAngle = -0.1f,  TwistMaxAngle = 0.1f,  Description = "Left Hip Sheathe" },
@@ -261,9 +271,34 @@ public unsafe class RagdollController : IDisposable
         return BuildBoneDefsFromConfigs(config.RagdollBoneConfigs.ToArray());
     }
 
+    private struct NpcBoneStatic
+    {
+        public StaticHandle Handle;
+        public int BoneIndex;
+        public int ParentBoneIndex;
+        public float HalfLength;
+    }
+
+    private const float NpcDefaultBoneRadius = 0.04f;
+    private const float NpcMinSegmentLength = 0.02f;
+
+    private struct NpcCollisionState
+    {
+        public nint NpcAddress;
+        public List<NpcBoneStatic> BoneStatics;
+        public StaticHandle FallbackHandle;
+        public bool IsFallback;
+    }
+
     public RagdollController(BoneTransformService boneService, Configuration config, IPluginLog log)
+        : this(boneService, null, config, log)
+    {
+    }
+
+    public RagdollController(BoneTransformService boneService, MovementBlockHook? movementBlockHook, Configuration config, IPluginLog log)
     {
         this.boneService = boneService;
+        this.movementBlockHook = movementBlockHook;
         this.config = config;
         this.log = log;
 
@@ -275,6 +310,9 @@ public unsafe class RagdollController : IDisposable
         if (isActive) Deactivate();
 
         targetCharacterAddress = characterAddress;
+        var gameObj = (FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)characterAddress;
+        savedCharacterPosition = new Vector3(gameObj->Position.X, gameObj->Position.Y, gameObj->Position.Z);
+        followWasActive = false;
         activationDelay = delayOverride ?? config.RagdollActivationDelay;
         elapsed = 0f;
         physicsStarted = false;
@@ -288,13 +326,16 @@ public unsafe class RagdollController : IDisposable
         if (!isActive) return;
         isActive = false;
 
-        // Restore animation speed
-        if (targetCharacterAddress != nint.Zero && physicsStarted)
+        // Restore animation speed. Death timelines can report 0 when physics starts;
+        // on cleanup we need to hand control back to the game with motion enabled.
+        if (targetCharacterAddress != nint.Zero)
         {
             try
             {
                 var character = (Character*)targetCharacterAddress;
-                character->Timeline.OverallSpeed = savedOverallSpeed;
+                character->Timeline.OverallSpeed = savedOverallSpeed > 0.01f && !float.IsNaN(savedOverallSpeed)
+                    ? savedOverallSpeed
+                    : 1.0f;
             }
             catch (Exception ex)
             {
@@ -303,6 +344,7 @@ public unsafe class RagdollController : IDisposable
         }
 
         targetCharacterAddress = nint.Zero;
+        followWasActive = false;
         physicsStarted = false;
         ragdollBoneIndices.Clear();
         nHaraIndex = -1;
@@ -345,6 +387,9 @@ public unsafe class RagdollController : IDisposable
 
     private Vector3 WorldToModel(Vector3 worldPos)
         => Vector3.Transform(worldPos - skelWorldPos, skelWorldRotInv);
+
+    private static Vector3 NpcModelToWorld(Vector3 modelPos, Vector3 npcSkelPos, Quaternion npcSkelRot)
+        => npcSkelPos + Vector3.Transform(modelPos, npcSkelRot);
 
     private Quaternion ModelRotToWorld(Quaternion modelRot)
         => Quaternion.Normalize(skelWorldRot * modelRot);
@@ -596,6 +641,29 @@ public unsafe class RagdollController : IDisposable
                     capsuleWorldRot = boneWorldRot;
                 }
             }
+            else if (def.ParentName != null &&
+                     boneWorldPositions.TryGetValue(def.ParentName, out var parentWorldPos))
+            {
+                var fromParent = boneWorldPos - parentWorldPos;
+                var fromParentLen = fromParent.Length();
+                if (fromParentLen > 0.01f)
+                {
+                    var maxHalf = MathF.Max(0.02f, fromParentLen * 0.45f);
+                    if (effectiveHalfLength > maxHalf)
+                        effectiveHalfLength = maxHalf;
+
+                    var dir = fromParent / fromParentLen;
+                    capsuleCenter = boneWorldPos + effectiveHalfLength * dir;
+                    segmentHalfLength = effectiveHalfLength;
+                    capsuleWorldRot = RotationFromYToDirection(fromParent);
+                }
+                else
+                {
+                    capsuleCenter = boneWorldPos;
+                    segmentHalfLength = 0f;
+                    capsuleWorldRot = boneWorldRot;
+                }
+            }
             else
             {
                 capsuleCenter = boneWorldPos;
@@ -616,12 +684,13 @@ public unsafe class RagdollController : IDisposable
             var capsuleLength = effectiveHalfLength * 2;
             var capsule = new Capsule(def.CapsuleRadius, capsuleLength);
             var shapeIndex = simulation.Shapes.Add(capsule);
+            var sleepThreshold = (config.RagdollNpcSettleCollision && config.RagdollNpcCollision) ? -1f : 0.01f;
 
             var bodyDesc = BodyDescription.CreateDynamic(
                 new RigidPose(capsuleCenter, capsuleWorldRot),
                 capsule.ComputeInertia(def.Mass),
                 new CollidableDescription(shapeIndex, 0.04f),
-                new BodyActivityDescription(0.01f));
+                new BodyActivityDescription(sleepThreshold));
 
             var bodyHandle = simulation.Bodies.Add(bodyDesc);
 
@@ -829,11 +898,15 @@ public unsafe class RagdollController : IDisposable
         // Freeze animation
         var character = (Character*)targetCharacterAddress;
         savedOverallSpeed = character->Timeline.OverallSpeed;
+        if (savedOverallSpeed <= 0.01f || float.IsNaN(savedOverallSpeed))
+            savedOverallSpeed = 1.0f;
         character->Timeline.OverallSpeed = 0f;
 
         // Resolve special bones
         nHaraIndex = boneService.ResolveBoneIndex(skel, "n_hara");
         kaoBodyBoneIndex = boneService.ResolveBoneIndex(skel, "j_kao");
+
+        CreateNpcCollisionVolumes();
 
         // Initialize hair physics
         if (config.RagdollHairPhysics && kaoBodyBoneIndex >= 0)
@@ -844,6 +917,203 @@ public unsafe class RagdollController : IDisposable
 
         log.Info($"RagdollController: Physics initialized — {ragdollBones.Count} bodies, ground={groundY:F3}");
         return ragdollBones.Count > 0;
+    }
+
+    private void CreateNpcCollisionVolumes()
+    {
+        npcCollisionStates.Clear();
+        if (simulation == null || !config.RagdollNpcCollision) return;
+
+        var scale = config.RagdollNpcCollisionScale;
+        var capsuleRadius = NpcDefaultBoneRadius * scale;
+        var fbRadius = 0.3f * scale;
+        var fbLength = MathF.Max(0.2f, 1.6f - fbRadius * 2f);
+        npcFallbackShapeIndex = simulation.Shapes.Add(new Capsule(fbRadius, fbLength));
+
+        foreach (var obj in Services.ObjectTable)
+        {
+            if ((byte)obj.ObjectKind != (byte)ObjectKind.BattleNpc) continue;
+            if (obj.Address == targetCharacterAddress) continue;
+
+            var npcAddr = obj.Address;
+            var npcSkel = boneService.TryGetSkeleton(npcAddr);
+            if (npcSkel == null)
+            {
+                CreateFallbackNpcCollision(npcAddr, obj.Name.TextValue);
+                continue;
+            }
+
+            var ns = npcSkel.Value;
+            var npcSkeleton = ns.CharBase->Skeleton;
+            if (npcSkeleton == null)
+            {
+                CreateFallbackNpcCollision(npcAddr, obj.Name.TextValue);
+                continue;
+            }
+
+            var npcSkelPos = new Vector3(
+                npcSkeleton->Transform.Position.X,
+                npcSkeleton->Transform.Position.Y,
+                npcSkeleton->Transform.Position.Z);
+            var npcSkelRot = new Quaternion(
+                npcSkeleton->Transform.Rotation.X,
+                npcSkeleton->Transform.Rotation.Y,
+                npcSkeleton->Transform.Rotation.Z,
+                npcSkeleton->Transform.Rotation.W);
+
+            var boneStatics = new List<NpcBoneStatic>();
+            var boneCount = Math.Min(ns.BoneCount, ns.ParentCount);
+            for (int i = 1; i < boneCount; i++)
+            {
+                var parentIdx = ns.HavokSkeleton->ParentIndices[i];
+                if (parentIdx < 0 || parentIdx >= ns.BoneCount) continue;
+
+                ref var parentMt = ref ns.Pose->ModelPose.Data[parentIdx];
+                var parentWorldPos = NpcModelToWorld(
+                    new Vector3(parentMt.Translation.X, parentMt.Translation.Y, parentMt.Translation.Z),
+                    npcSkelPos, npcSkelRot);
+
+                ref var childMt = ref ns.Pose->ModelPose.Data[i];
+                var childWorldPos = NpcModelToWorld(
+                    new Vector3(childMt.Translation.X, childMt.Translation.Y, childMt.Translation.Z),
+                    npcSkelPos, npcSkelRot);
+
+                var segment = childWorldPos - parentWorldPos;
+                var segLen = segment.Length();
+                if (segLen < NpcMinSegmentLength) continue;
+
+                var halfLen = segLen * 0.45f * scale;
+                var shapeIndex = simulation.Shapes.Add(new Capsule(capsuleRadius, halfLen * 2f));
+                var capsuleCenter = parentWorldPos + halfLen * (segment / segLen);
+                var capsuleRot = RotationFromYToDirection(segment);
+                var staticHandle = simulation.Statics.Add(new StaticDescription(capsuleCenter, capsuleRot, shapeIndex));
+
+                boneStatics.Add(new NpcBoneStatic
+                {
+                    Handle = staticHandle,
+                    BoneIndex = i,
+                    ParentBoneIndex = parentIdx,
+                    HalfLength = halfLen,
+                });
+            }
+
+            if (boneStatics.Count > 0)
+            {
+                npcCollisionStates.Add(new NpcCollisionState
+                {
+                    NpcAddress = npcAddr,
+                    BoneStatics = boneStatics,
+                    IsFallback = false,
+                });
+            }
+            else
+            {
+                CreateFallbackNpcCollision(npcAddr, obj.Name.TextValue);
+            }
+        }
+
+        var totalNpcStatics = 0;
+        foreach (var s in npcCollisionStates)
+            totalNpcStatics += s.IsFallback ? 1 : s.BoneStatics.Count;
+        if (totalNpcStatics > 0)
+            log.Info($"RagdollController: NPC collision volumes initialized - {npcCollisionStates.Count} NPCs, {totalNpcStatics} volumes");
+    }
+
+    private void CreateFallbackNpcCollision(nint npcAddr, string name)
+    {
+        if (simulation == null) return;
+        var go = (FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)npcAddr;
+        var npcPos = new Vector3(go->Position.X, go->Position.Y + 0.8f, go->Position.Z);
+        var handle = simulation.Statics.Add(new StaticDescription(npcPos, Quaternion.Identity, npcFallbackShapeIndex));
+        npcCollisionStates.Add(new NpcCollisionState
+        {
+            NpcAddress = npcAddr,
+            BoneStatics = new List<NpcBoneStatic>(),
+            FallbackHandle = handle,
+            IsFallback = true,
+        });
+        if (config.RagdollVerboseLog)
+            log.Info($"RagdollController: NPC '{name}' using fallback collision capsule");
+    }
+
+    private void UpdateNpcCollisionVolumes()
+    {
+        if (simulation == null || npcCollisionStates.Count == 0) return;
+
+        for (int i = 0; i < npcCollisionStates.Count; i++)
+        {
+            var npcState = npcCollisionStates[i];
+            try
+            {
+                if (npcState.IsFallback)
+                {
+                    var go = (FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)npcState.NpcAddress;
+                    var staticRef = simulation.Statics.GetStaticReference(npcState.FallbackHandle);
+                    staticRef.Pose.Position = new Vector3(go->Position.X, go->Position.Y + 0.8f, go->Position.Z);
+                    staticRef.UpdateBounds();
+                    continue;
+                }
+
+                var npcSkel = boneService.TryGetSkeleton(npcState.NpcAddress);
+                if (npcSkel == null) continue;
+
+                var ns = npcSkel.Value;
+                var npcSkeleton = ns.CharBase->Skeleton;
+                if (npcSkeleton == null) continue;
+
+                var npcSkelPos = new Vector3(
+                    npcSkeleton->Transform.Position.X,
+                    npcSkeleton->Transform.Position.Y,
+                    npcSkeleton->Transform.Position.Z);
+                var npcSkelRot = new Quaternion(
+                    npcSkeleton->Transform.Rotation.X,
+                    npcSkeleton->Transform.Rotation.Y,
+                    npcSkeleton->Transform.Rotation.Z,
+                    npcSkeleton->Transform.Rotation.W);
+
+                for (int b = 0; b < npcState.BoneStatics.Count; b++)
+                {
+                    var bs = npcState.BoneStatics[b];
+                    if (bs.BoneIndex < 0 || bs.BoneIndex >= ns.BoneCount) continue;
+                    if (bs.ParentBoneIndex < 0 || bs.ParentBoneIndex >= ns.BoneCount) continue;
+
+                    ref var parentMt = ref ns.Pose->ModelPose.Data[bs.ParentBoneIndex];
+                    var parentWorldPos = NpcModelToWorld(
+                        new Vector3(parentMt.Translation.X, parentMt.Translation.Y, parentMt.Translation.Z),
+                        npcSkelPos, npcSkelRot);
+
+                    ref var childMt = ref ns.Pose->ModelPose.Data[bs.BoneIndex];
+                    var childWorldPos = NpcModelToWorld(
+                        new Vector3(childMt.Translation.X, childMt.Translation.Y, childMt.Translation.Z),
+                        npcSkelPos, npcSkelRot);
+
+                    var segment = childWorldPos - parentWorldPos;
+                    var segLen = segment.Length();
+                    Vector3 capsuleCenter;
+                    Quaternion capsuleRot;
+                    if (segLen > 0.01f)
+                    {
+                        var segDir = segment / segLen;
+                        capsuleCenter = parentWorldPos + bs.HalfLength * segDir;
+                        capsuleRot = RotationFromYToDirection(segment);
+                    }
+                    else
+                    {
+                        capsuleCenter = parentWorldPos;
+                        capsuleRot = Quaternion.Identity;
+                    }
+
+                    var staticRef = simulation.Statics.GetStaticReference(bs.Handle);
+                    staticRef.Pose.Position = capsuleCenter;
+                    staticRef.Pose.Orientation = capsuleRot;
+                    staticRef.UpdateBounds();
+                }
+            }
+            catch
+            {
+                // Object table entries can vanish mid-frame; keep the last valid static pose.
+            }
+        }
     }
 
     private void StepAndApply()
@@ -891,6 +1161,8 @@ public unsafe class RagdollController : IDisposable
             skelWorldRotInv = Quaternion.Inverse(skelWorldRot);
         }
 
+        UpdateNpcCollisionVolumes();
+
         // Step physics
         simulation.Timestep(1.0f / 60.0f);
 
@@ -912,6 +1184,7 @@ public unsafe class RagdollController : IDisposable
         var worldPositions = new Vector3[boneCount];
         var worldRotations = new Quaternion[boneCount];
         var boneValid = new bool[boneCount];
+        var lowestCapsuleBottomY = float.MaxValue;
 
         for (int i = 0; i < boneCount; i++)
         {
@@ -941,6 +1214,35 @@ public unsafe class RagdollController : IDisposable
             }
 
             boneValid[i] = true;
+
+            RagdollBoneDef boneDef = default;
+            foreach (var def in BoneDefs)
+                if (def.Name == rb.Name) { boneDef = def; break; }
+            var capsuleYDir = Vector3.Transform(Vector3.UnitY, bodyRef.Pose.Orientation);
+            var capsuleBottomY = bodyRef.Pose.Position.Y
+                                 - MathF.Abs(capsuleYDir.Y) * boneDef.CapsuleHalfLength
+                                 - boneDef.CapsuleRadius;
+            if (capsuleBottomY < lowestCapsuleBottomY)
+                lowestCapsuleBottomY = capsuleBottomY;
+        }
+
+        var logThisFrame = config.RagdollVerboseLog && (frameCount <= 3 || frameCount % 12 == 0);
+        if (logThisFrame)
+        {
+            var awakeBodies = 0;
+            var maxLinVel = 0f;
+            var maxAngVel = 0f;
+            for (int i = 0; i < boneCount; i++)
+            {
+                if (!boneValid[i]) continue;
+                var bodyRef = simulation.Bodies.GetBodyReference(ragdollBones[i].BodyHandle);
+                if (bodyRef.Awake) awakeBodies++;
+                maxLinVel = MathF.Max(maxLinVel, bodyRef.Velocity.Linear.Length());
+                maxAngVel = MathF.Max(maxAngVel, bodyRef.Velocity.Angular.Length());
+            }
+            log.Info($"[Ragdoll F{frameCount}] t={frameCount / 60f:F2}s awake={awakeBodies}/{boneCount} " +
+                     $"lowestY={lowestCapsuleBottomY:F3} realGnd={realGroundY:F3} " +
+                     $"maxLinVel={maxLinVel:F3} maxAngVel={maxAngVel:F3}");
         }
 
         // --- Pass 2: Write to ModelPose ---
@@ -989,6 +1291,27 @@ public unsafe class RagdollController : IDisposable
                 skel.CharBase, kaoBodyBoneIndex,
                 skelWorldPos, skelWorldRot, skelWorldRotInv,
                 1.0f / 60.0f);
+        }
+
+        if (config.RagdollFollowPosition && movementBlockHook != null && ragdollBones.Count > 0 && targetCharacterAddress != nint.Zero)
+        {
+            try
+            {
+                var rootBody = simulation.Bodies.GetBodyReference(ragdollBones[0].BodyHandle);
+                var rootPos = rootBody.Pose.Position;
+                var gameObj = (FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)targetCharacterAddress;
+                movementBlockHook.SetApproachPosition(gameObj, rootPos.X, rootPos.Y, rootPos.Z);
+                followWasActive = true;
+            }
+            catch
+            {
+            }
+        }
+        else if (followWasActive)
+        {
+            // Stop controlling position immediately. Do not force a saved death
+            // position back onto the actor; revive/zone/server state should win.
+            followWasActive = false;
         }
     }
 
@@ -1121,6 +1444,7 @@ public unsafe class RagdollController : IDisposable
     private void DestroySimulation()
     {
         ragdollBones.Clear();
+        npcCollisionStates.Clear();
         simulation?.Dispose();
         simulation = null;
         bufferPool?.Clear();

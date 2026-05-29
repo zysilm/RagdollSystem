@@ -20,6 +20,15 @@ public unsafe class MainWindow : IDisposable
 
     // Currently editing bone name (for debug overlay highlight)
     public string? EditingBoneName;
+    public EditParam EditingParameter { get; private set; }
+
+    public enum EditParam
+    {
+        None,
+        Swing,
+        TwistMin,
+        TwistMax,
+    }
 
     public MainWindow(Configuration config, RagdollSystemPlugin plugin, IClientState clientState, IPluginLog log)
     {
@@ -99,7 +108,7 @@ public unsafe class MainWindow : IDisposable
         { config.RagdollDamping = damping; config.Save(); }
 
         var solverIterations = config.RagdollSolverIterations;
-        if (ImGui.SliderInt("Solver Iterations", ref solverIterations, 1, 16))
+        if (ImGui.SliderInt("Solver Iterations", ref solverIterations, 1, 64))
         { config.RagdollSolverIterations = solverIterations; config.Save(); }
 
         var selfCollision = config.RagdollSelfCollision;
@@ -144,6 +153,11 @@ public unsafe class MainWindow : IDisposable
         if (ImGui.Checkbox("Verbose Logging", ref verboseLog))
         { config.RagdollVerboseLog = verboseLog; config.Save(); }
 
+        var followPosition = config.RagdollFollowPosition;
+        if (ImGui.Checkbox("Ragdoll Follow Position", ref followPosition))
+        { config.RagdollFollowPosition = followPosition; config.Save(); }
+        ImGui.TextDisabled("Moves the game object with the ragdoll root during long falls.");
+
         ImGui.Spacing();
         if (ImGui.Button("Test: Activate Ragdoll on Player"))
         {
@@ -178,12 +192,44 @@ public unsafe class MainWindow : IDisposable
         if (ImGui.SliderInt("Max Concurrent NPC Ragdolls", ref maxNpc, 1, 10))
         { config.MaxNpcRagdolls = maxNpc; config.Save(); }
         ImGui.TextDisabled("Limits performance impact. Oldest ragdolls are removed first.");
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.TextColored(new Vector4(0.7f, 0.85f, 1f, 1f), "NPC Collision");
+        ImGui.Spacing();
+
+        var npcCollision = config.RagdollNpcCollision;
+        if (ImGui.Checkbox("Enable NPC Collision##npccol", ref npcCollision))
+        { config.RagdollNpcCollision = npcCollision; config.Save(); }
+        ImGui.TextWrapped("Creates per-bone collision volumes for nearby battle NPCs so ragdolls can collide with them.");
+
+        if (config.RagdollNpcCollision)
+        {
+            var npcScale = config.RagdollNpcCollisionScale;
+            if (ImGui.SliderFloat("NPC Collision Scale##npccol", ref npcScale, 0.0001f, 5.0f, "%.4f"))
+            { config.RagdollNpcCollisionScale = npcScale; config.Save(); }
+
+            var settleCol = config.RagdollNpcSettleCollision;
+            if (ImGui.Checkbox("Enable Settle Collision##settle", ref settleCol))
+            { config.RagdollNpcSettleCollision = settleCol; config.Save(); }
+            ImGui.TextDisabled("Keeps ragdoll bodies awake so they continue reacting to NPC collision.");
+        }
     }
 
     private void DrawRagdollAdvancedSection()
     {
         ImGui.TextColored(new Vector4(0.7f, 0.85f, 1f, 1f), "Per-Bone Physics Parameters");
         ImGui.TextWrapped("Toggle bones on/off for physics. Adjust rotation limits, capsule volume, and mass.");
+        ImGui.Spacing();
+
+        DrawRagdollBoneProfilesSection();
+
+        var debugOverlay = config.RagdollDebugOverlay;
+        if (ImGui.Checkbox("Show Debug Overlay##ragdollAdv", ref debugOverlay))
+        {
+            config.RagdollDebugOverlay = debugOverlay;
+            config.Save();
+        }
         ImGui.Spacing();
 
         // Quick toggle for weapon holster/sheathe bones
@@ -301,27 +347,27 @@ public unsafe class MainWindow : IDisposable
 
                     var radius = bone.CapsuleRadius;
                     if (ImGui.SliderFloat($"Capsule Radius{id}", ref radius, 0.01f, 0.3f, "%.3f"))
-                    { bone.CapsuleRadius = radius; changed = true; EditingBoneName = bone.Name; }
+                    { bone.CapsuleRadius = radius; changed = true; EditingBoneName = bone.Name; EditingParameter = EditParam.None; }
 
                     var halfLen = bone.CapsuleHalfLength;
                     if (ImGui.SliderFloat($"Capsule Half-Length{id}", ref halfLen, 0.0f, 0.3f, "%.3f"))
-                    { bone.CapsuleHalfLength = halfLen; changed = true; EditingBoneName = bone.Name; }
+                    { bone.CapsuleHalfLength = halfLen; changed = true; EditingBoneName = bone.Name; EditingParameter = EditParam.None; }
 
                     var mass = bone.Mass;
                     if (ImGui.SliderFloat($"Mass{id}", ref mass, 0.1f, 15.0f, "%.1f"))
-                    { bone.Mass = mass; changed = true; EditingBoneName = bone.Name; }
+                    { bone.Mass = mass; changed = true; EditingBoneName = bone.Name; EditingParameter = EditParam.None; }
 
                     var swing = bone.SwingLimit;
                     if (ImGui.SliderFloat($"Swing Limit (rad){id}", ref swing, 0.0f, MathF.PI, "%.2f"))
-                    { bone.SwingLimit = swing; changed = true; EditingBoneName = bone.Name; }
+                    { bone.SwingLimit = swing; changed = true; EditingBoneName = bone.Name; EditingParameter = EditParam.Swing; }
 
                     var twistMin = bone.TwistMinAngle;
                     if (ImGui.SliderFloat($"Twist Min (rad){id}", ref twistMin, -MathF.PI, 0f, "%.2f"))
-                    { bone.TwistMinAngle = twistMin; changed = true; EditingBoneName = bone.Name; }
+                    { bone.TwistMinAngle = twistMin; changed = true; EditingBoneName = bone.Name; EditingParameter = EditParam.TwistMin; }
 
                     var twistMax = bone.TwistMaxAngle;
                     if (ImGui.SliderFloat($"Twist Max (rad){id}", ref twistMax, 0f, MathF.PI, "%.2f"))
-                    { bone.TwistMaxAngle = twistMax; changed = true; EditingBoneName = bone.Name; }
+                    { bone.TwistMaxAngle = twistMax; changed = true; EditingBoneName = bone.Name; EditingParameter = EditParam.TwistMax; }
 
                     // Soft body settings
                     var softBody = bone.SoftBody;
@@ -436,6 +482,65 @@ public unsafe class MainWindow : IDisposable
             });
         }
         config.Save();
+    }
+
+    private static RagdollBoneConfig CloneBoneConfig(RagdollBoneConfig src)
+    {
+        return new RagdollBoneConfig
+        {
+            Name = src.Name,
+            SkeletonParent = src.SkeletonParent,
+            Enabled = src.Enabled,
+            CapsuleRadius = src.CapsuleRadius,
+            CapsuleHalfLength = src.CapsuleHalfLength,
+            Mass = src.Mass,
+            SwingLimit = src.SwingLimit,
+            JointType = src.JointType,
+            TwistMinAngle = src.TwistMinAngle,
+            TwistMaxAngle = src.TwistMaxAngle,
+            Description = src.Description,
+            SoftBody = src.SoftBody,
+            SoftSpringFreq = src.SoftSpringFreq,
+            SoftSpringDamp = src.SoftSpringDamp,
+            SoftServoFreq = src.SoftServoFreq,
+            SoftServoDamp = src.SoftServoDamp,
+        };
+    }
+
+    private void DrawRagdollBoneProfilesSection()
+    {
+        if (!ImGui.CollapsingHeader("Bone Profiles##ragdollProfiles")) return;
+
+        if (config.RagdollBoneProfiles.Count == 0)
+            ImGui.TextDisabled("No saved profiles.");
+
+        for (var i = 0; i < config.RagdollBoneProfiles.Count; i++)
+        {
+            var profile = config.RagdollBoneProfiles[i];
+            if (ImGui.Button($"Load##profile{i}"))
+                LoadBoneProfile(profile);
+            ImGui.SameLine();
+            ImGui.Text($"{profile.Name} ({profile.Bones.Count} bones)");
+        }
+
+        ImGui.Spacing();
+        if (ImGui.Button("Reset Live Configs to Built-In Defaults##profileDefaults"))
+        {
+            config.RagdollBoneConfigs.Clear();
+            foreach (var def in RagdollController.AllBoneDefaults)
+                config.RagdollBoneConfigs.Add(CloneBoneConfig(def));
+            config.Save();
+            ReactivatePlayerRagdoll();
+        }
+    }
+
+    private void LoadBoneProfile(RagdollBoneProfile profile)
+    {
+        config.RagdollBoneConfigs.Clear();
+        foreach (var bone in profile.Bones)
+            config.RagdollBoneConfigs.Add(CloneBoneConfig(bone));
+        config.Save();
+        ReactivatePlayerRagdoll();
     }
 
     private void SyncConfigWithSkeleton()

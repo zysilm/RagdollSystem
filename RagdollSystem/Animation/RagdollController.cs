@@ -52,6 +52,26 @@ public unsafe class RagdollController : IDisposable
     // Diagnostic frame counter
     private int frameCount;
 
+    // Active bone definitions (human profile or generated generic set), keyed by name.
+    // StepAndApply reads capsule extents from this O(1) map instead of re-scanning the
+    // human BoneDefs each frame — and for generic rigs the human set wouldn't contain
+    // the generated "gen_*" names at all, so this is also a correctness requirement.
+    private readonly Dictionary<string, RagdollBoneDef> activeDefByName = new();
+    // True when the active ragdoll was generated from a non-humanoid skeleton topology.
+    private bool activeRagdollIsGeneric;
+
+    // --- Generic (non-humanoid) ragdoll tuning ---
+    // The min-segment threshold is adaptive to skeleton size (see BuildGenericSkeletonDefs).
+    private const float GenericMinSegmentCap = 0.08f;    // upper bound for big skeletons
+    private const float GenericMinSegmentFloor = 0.02f;  // lower bound for small skeletons (bats)
+    private const float GenericMinSegmentFactor = 0.06f; // fraction of the skeleton's largest segment
+    private const int GenericMaxBodies = 40;             // cap solver load on large rigs
+    private const float GenericSwingLimit = 0.6f;        // ball cone half-angle (rad)
+    private const float GenericTwistLimit = 0.35f;       // ball axial twist (rad)
+    private const int GenericSolverIterations = 16;      // generic rigs need more iterations to converge
+    private const float GenericMaxLinearVelocity = 12f;  // m/s — clamp per frame to stop energy blow-up
+    private const float GenericMaxAngularVelocity = 16f; // rad/s — clamp per frame (tiny bodies spin up fastest)
+
     // Animation freeze state
     private float savedOverallSpeed = 1.0f;
     private readonly HashSet<int> ragdollBoneIndices = new();
@@ -408,6 +428,165 @@ public unsafe class RagdollController : IDisposable
         return Quaternion.CreateFromAxisAngle(axis, angle);
     }
 
+    // --- Non-humanoid (generic) ragdoll support ---
+
+    // Structural bones every humanoid skeleton has. If all resolve, the hand-tuned
+    // human profile fits and the existing passes run unchanged. If any is missing
+    // (bats, birds, dragons, quadrupeds, voidsent) the skeleton is treated as
+    // non-humanoid and gets a generated ragdoll instead.
+    private static readonly string[] HumanoidSignatureBones =
+    {
+        "j_kosi", "j_sebo_a", "j_kubi",
+        "j_ude_a_l", "j_ude_a_r",
+        "j_asi_a_l", "j_asi_a_r",
+    };
+
+    private bool IsHumanoidSkeleton(Dictionary<string, int> humanNameToIndex)
+    {
+        foreach (var bone in HumanoidSignatureBones)
+            if (!humanNameToIndex.ContainsKey(bone))
+                return false;
+        return true;
+    }
+
+    /// <summary>
+    /// Build a ragdoll bone definition set from a skeleton's real topology, for
+    /// non-humanoid characters where the human profile does not fit. Capsule size
+    /// and mass scale with actual bone lengths (so small rigs like bats do not get
+    /// oversized human capsules that explode), parents follow the real skeleton
+    /// hierarchy (no human-name mapping, so no orphaning), and all joints are loose
+    /// ball joints. The returned defs feed the same Pass 1/2/3 body/constraint build
+    /// and StepAndApply write-back as the human path.
+    /// </summary>
+    private (RagdollBoneDef[] Defs, Dictionary<string, int> NameToIndex) BuildGenericSkeletonDefs(SkeletonAccess skel)
+    {
+        var pose = skel.Pose;
+        int n = skel.BoneCount;
+        int pc = skel.ParentCount;
+
+        // World position of every bone in the current (death) pose.
+        var wpos = new Vector3[n];
+        for (int i = 0; i < n; i++)
+        {
+            ref var mt = ref pose->ModelPose.Data[i];
+            wpos[i] = ModelToWorld(new Vector3(mt.Translation.X, mt.Translation.Y, mt.Translation.Z));
+        }
+
+        int ParentOf(int i) => (i >= 0 && i < pc) ? skel.HavokSkeleton->ParentIndices[i] : -1;
+
+        // Distance to direct parent, and the longest child segment a bone owns.
+        var distToParent = new float[n];
+        var longestChildLen = new float[n];
+        for (int i = 0; i < n; i++)
+        {
+            int p = ParentOf(i);
+            if (p < 0 || p >= n) continue;
+            var d = Vector3.Distance(wpos[i], wpos[p]);
+            distToParent[i] = d;
+            if (d > longestChildLen[p]) longestChildLen[p] = d;
+        }
+
+        // Adaptive min-segment threshold scaled to the skeleton's own size: a fraction of
+        // its largest segment, clamped to [floor, cap]. Big rigs (toad, longest segment
+        // ~1.7m) land at the cap and stay sparse; small rigs (bat, ~0.2m) drop to the floor
+        // so their wing/limb bones are simulated instead of being skipped as "twigs".
+        float maxSegment = 0f;
+        for (int i = 0; i < n; i++)
+            if (longestChildLen[i] > maxSegment) maxSegment = longestChildLen[i];
+        float minSegment = Math.Clamp(maxSegment * GenericMinSegmentFactor, GenericMinSegmentFloor, GenericMinSegmentCap);
+        log.Info($"RagdollController: generic min-segment threshold {minSegment:F3}m (skeleton largest segment {maxSegment:F3}m)");
+
+        // A bone gets a body if it owns a real forward segment. Coincident/twig bones
+        // (fingers, tips) are skipped and follow via StepAndApply propagation.
+        var significant = new bool[n];
+        int significantCount = 0;
+        for (int i = 0; i < n; i++)
+        {
+            if (longestChildLen[i] >= minSegment)
+            {
+                significant[i] = true;
+                significantCount++;
+            }
+        }
+
+        // Cap body count on large rigs: keep the longest segments, but force-keep the
+        // significant ancestors of kept bones so the constraint tree stays connected
+        // (a kept bone whose ancestors were dropped would become a free-floating root).
+        if (significantCount > GenericMaxBodies)
+        {
+            var ranked = new List<int>();
+            for (int i = 0; i < n; i++)
+                if (significant[i]) ranked.Add(i);
+            ranked.Sort((a, b) => longestChildLen[b].CompareTo(longestChildLen[a]));
+
+            var keep = new bool[n];
+            for (int k = 0; k < GenericMaxBodies && k < ranked.Count; k++)
+            {
+                keep[ranked[k]] = true;
+                int p = ParentOf(ranked[k]);
+                while (p >= 0)
+                {
+                    if (significant[p]) keep[p] = true;
+                    p = ParentOf(p);
+                }
+            }
+            for (int i = 0; i < n; i++)
+                significant[i] = significant[i] && keep[i];
+        }
+
+        int SignificantAncestor(int i)
+        {
+            int p = ParentOf(i);
+            while (p >= 0)
+            {
+                if (significant[p]) return p;
+                p = ParentOf(p);
+            }
+            return -1;
+        }
+
+        string Name(int i) => "gen_" + i.ToString();
+
+        var simIndices = new List<int>();
+        for (int i = 0; i < n; i++)
+            if (significant[i]) simIndices.Add(i);
+
+        // Emit roots first, then longest-from-parent first, so boneToFirstChild picks
+        // each bone's longest child as its capsule axis (best rotational stability).
+        simIndices.Sort((a, b) =>
+        {
+            bool aRoot = SignificantAncestor(a) < 0;
+            bool bRoot = SignificantAncestor(b) < 0;
+            if (aRoot != bRoot) return aRoot ? -1 : 1;
+            return distToParent[b].CompareTo(distToParent[a]);
+        });
+
+        var nameToIndex = new Dictionary<string, int>();
+        foreach (var i in simIndices)
+            nameToIndex[Name(i)] = i;
+
+        var defs = new List<RagdollBoneDef>(simIndices.Count);
+        foreach (var i in simIndices)
+        {
+            float segLen = MathF.Max(longestChildLen[i], minSegment);
+            int anc = SignificantAncestor(i);
+            defs.Add(new RagdollBoneDef
+            {
+                Name = Name(i),
+                ParentName = anc >= 0 ? Name(anc) : null,
+                CapsuleRadius = Math.Clamp(segLen * 0.28f, 0.02f, 0.18f),
+                CapsuleHalfLength = segLen * 0.45f,
+                Mass = Math.Clamp(segLen * 20f, 0.5f, 12f),
+                SwingLimit = GenericSwingLimit,
+                Joint = JointType.Ball,
+                TwistMinAngle = -GenericTwistLimit,
+                TwistMaxAngle = GenericTwistLimit,
+            });
+        }
+
+        return (defs.ToArray(), nameToIndex);
+    }
+
     private static Quaternion CreateTwistBasis(Vector3 twistAxis, Vector3 referenceDir)
     {
         var z = Vector3.Normalize(twistAxis);
@@ -456,10 +635,15 @@ public unsafe class RagdollController : IDisposable
 
         // Resolve bone indices
         var nameToIndex = new Dictionary<string, int>();
+        // Name → definition, used to walk the config parent chain when a bone's
+        // direct parent is missing from the skeleton (see parent resolution below).
+        var defByName = new Dictionary<string, RagdollBoneDef>();
         ragdollBones.Clear();
 
         foreach (var def in BoneDefs)
         {
+            defByName[def.Name] = def;
+
             var idx = boneService.ResolveBoneIndex(skel, def.Name);
             if (idx < 0)
             {
@@ -468,6 +652,30 @@ public unsafe class RagdollController : IDisposable
             }
             nameToIndex[def.Name] = idx;
         }
+
+        // --- Humanoid vs non-humanoid dispatch ---
+        // Humanoid skeletons keep the hand-tuned human profile and existing passes,
+        // completely unchanged. Non-humanoid skeletons (bats, birds, dragons,
+        // quadrupeds) get a ragdoll generated from their real bone topology with
+        // adaptive capsule sizing and generic ball joints, then run the SAME passes.
+        bool genericSkeleton = !IsHumanoidSkeleton(nameToIndex);
+        activeRagdollIsGeneric = genericSkeleton;
+        if (genericSkeleton)
+        {
+            var (genDefs, genNameToIndex) = BuildGenericSkeletonDefs(skel);
+            log.Info($"RagdollController: non-humanoid skeleton — generated {genDefs.Length} generic ragdoll bones (human matches were {nameToIndex.Count})");
+            BoneDefs = genDefs;
+            nameToIndex = genNameToIndex;
+            defByName.Clear();
+            foreach (var def in BoneDefs)
+                defByName[def.Name] = def;
+        }
+
+        // Record the active defs so StepAndApply reads capsule extents from the set
+        // actually in use (human or generated) rather than re-deriving the human set.
+        activeDefByName.Clear();
+        foreach (var def in BoneDefs)
+            activeDefByName[def.Name] = def;
 
         // Raycast for ground height
         groundY = skelWorldPos.Y;
@@ -480,8 +688,21 @@ public unsafe class RagdollController : IDisposable
             groundY = hitInfo.Point.Y;
         }
 
-        // Create BEPU simulation
-        var connectedPairs = config.RagdollSelfCollision ? new HashSet<(int, int)>() : null;
+        // Create BEPU simulation.
+        // Generic (non-humanoid) ragdolls force self-collision OFF: their generated
+        // capsules commonly overlap (fat/compact bodies like toads), and body-body
+        // contact on overlapping capsules produces explosive separation forces. The
+        // human profile is hand-tuned so its capsules don't overlap, so it keeps it.
+        var connectedPairs = (config.RagdollSelfCollision && !genericSkeleton)
+            ? new HashSet<(int, int)>()
+            : null;
+
+        // Generic rigs build a stiffer, less-conditioned constraint network — give the
+        // solver more iterations so it converges instead of pumping energy each frame.
+        var solverIterations = config.RagdollSolverIterations;
+        if (genericSkeleton)
+            solverIterations = Math.Max(solverIterations, GenericSolverIterations);
+
         bufferPool = new BufferPool();
         simulation = BepuSimulation.Create(
             bufferPool,
@@ -489,7 +710,7 @@ public unsafe class RagdollController : IDisposable
             new RagdollPoseIntegratorCallbacks(
                 new Vector3(0, -config.RagdollGravity, 0),
                 config.RagdollDamping),
-            new SolveDescription(config.RagdollSolverIterations, 1));
+            new SolveDescription(solverIterations, 1));
 
         // Safety net box
         var groundThickness = 10f;
@@ -694,9 +915,29 @@ public unsafe class RagdollController : IDisposable
 
             var bodyHandle = simulation.Bodies.Add(bodyDesc);
 
+            // Resolve the constraint parent by walking up the config parent chain to
+            // the nearest ancestor that actually exists in this skeleton. On a complete
+            // human skeleton the direct parent always resolves, so this matches on the
+            // first step and behaves identically to a direct lookup. On monster skeletons
+            // that lack intermediate bones (e.g. no neck j_kubi between chest and head),
+            // this keeps the leaf bone attached to its nearest present ancestor instead of
+            // orphaning it into an unconstrained free body that drifts away from the corpse.
             int parentBoneIdx = -1;
-            if (def.ParentName != null && nameToIndex.TryGetValue(def.ParentName, out var pIdx))
-                parentBoneIdx = pIdx;
+            var ancestorName = def.ParentName;
+            while (ancestorName != null)
+            {
+                if (nameToIndex.TryGetValue(ancestorName, out var pIdx))
+                {
+                    parentBoneIdx = pIdx;
+                    if (ancestorName != def.ParentName)
+                        log.Info($"[Ragdoll Init] '{def.Name}' parent '{def.ParentName}' missing; attached to ancestor '{ancestorName}'");
+                    break;
+                }
+
+                ancestorName = defByName.TryGetValue(ancestorName, out var ancestorDef)
+                    ? ancestorDef.ParentName
+                    : null;
+            }
 
             ragdollBones.Add(new RagdollBone
             {
@@ -1123,7 +1364,6 @@ public unsafe class RagdollController : IDisposable
         var skelNullable = boneService.TryGetSkeleton(targetCharacterAddress);
         if (skelNullable == null) return;
         var skel = skelNullable.Value;
-        var BoneDefs = GetBoneDefs();
 
         // Keep animation frozen
         var character = (Character*)targetCharacterAddress;
@@ -1165,6 +1405,28 @@ public unsafe class RagdollController : IDisposable
 
         // Step physics
         simulation.Timestep(1.0f / 60.0f);
+
+        // Generic rigs can still inject energy through their stiff auto-built constraint
+        // network (small bodies + dense joints), building up over a second into a
+        // fly-across-the-map explosion. Clamp per-body velocity each frame as a hard
+        // ceiling: real ragdoll fall speeds stay well under these, so settling looks
+        // normal, but runaway growth is capped. Human rigs are hand-tuned and skip this.
+        if (activeRagdollIsGeneric)
+        {
+            foreach (var rb in ragdollBones)
+            {
+                var body = simulation.Bodies.GetBodyReference(rb.BodyHandle);
+                if (!body.Awake) continue;
+                var lin = body.Velocity.Linear;
+                var linSpeed = lin.Length();
+                if (linSpeed > GenericMaxLinearVelocity)
+                    body.Velocity.Linear = lin * (GenericMaxLinearVelocity / linSpeed);
+                var ang = body.Velocity.Angular;
+                var angSpeed = ang.Length();
+                if (angSpeed > GenericMaxAngularVelocity)
+                    body.Velocity.Angular = ang * (GenericMaxAngularVelocity / angSpeed);
+            }
+        }
 
         var pose = skel.Pose;
 
@@ -1215,9 +1477,10 @@ public unsafe class RagdollController : IDisposable
 
             boneValid[i] = true;
 
-            RagdollBoneDef boneDef = default;
-            foreach (var def in BoneDefs)
-                if (def.Name == rb.Name) { boneDef = def; break; }
+            // O(1) lookup of the active capsule extents (replaces a per-bone linear scan
+            // of BoneDefs — important once generic rigs push body count toward 40, and
+            // required for generic rigs whose "gen_*" names aren't in the human BoneDefs).
+            activeDefByName.TryGetValue(rb.Name, out var boneDef);
             var capsuleYDir = Vector3.Transform(Vector3.UnitY, bodyRef.Pose.Orientation);
             var capsuleBottomY = bodyRef.Pose.Position.Y
                                  - MathF.Abs(capsuleYDir.Y) * boneDef.CapsuleHalfLength

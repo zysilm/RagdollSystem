@@ -3,8 +3,10 @@ using System.Collections.Generic;
 using System.Linq;
 using RagdollSystem.Animation;
 using RagdollSystem.Core;
+using RagdollSystem.Dev;
 using RagdollSystem.Game;
 using RagdollSystem.Gui;
+using RagdollSystem.Integration;
 using RagdollSystem.Safety;
 using Dalamud.Game.Command;
 using Dalamud.Plugin;
@@ -29,6 +31,9 @@ public sealed class RagdollSystemPlugin : IDalamudPlugin
     private readonly BoneTransformService boneTransformService;
     private readonly MovementBlockHook movementBlockHook;
     private readonly DeathDetector deathDetector;
+    private readonly GlamourerIpc glamourerIpc;
+    private readonly GearDropController gearDropController;
+    private readonly KoStripController koStripController;
     private readonly MainWindow mainWindow;
     private readonly RagdollDebugOverlay debugOverlay;
 
@@ -47,6 +52,7 @@ public sealed class RagdollSystemPlugin : IDalamudPlugin
         IObjectTable objectTable,
         IFramework framework,
         IGameInteropProvider gameInterop,
+        IDataManager dataManager,
         IGameGui gameGui,
         IChatGui chatGui,
         ICondition condition,
@@ -62,7 +68,7 @@ public sealed class RagdollSystemPlugin : IDalamudPlugin
         this.log = log;
 
         Services.Init(pluginInterface, clientState, objectTable, framework,
-            gameInterop, gameGui, chatGui, condition, log);
+            gameInterop, dataManager, gameGui, chatGui, condition, log);
 
         config = pluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
         config.Initialize(pluginInterface);
@@ -70,8 +76,11 @@ public sealed class RagdollSystemPlugin : IDalamudPlugin
         boneTransformService = new BoneTransformService(gameInterop, sigScanner, log);
         movementBlockHook = new MovementBlockHook(gameInterop, log);
         deathDetector = new DeathDetector(clientState, objectTable, log);
+        glamourerIpc = new GlamourerIpc(pluginInterface, log);
+        gearDropController = new GearDropController(boneTransformService, glamourerIpc, objectTable, config, log);
+        koStripController = new KoStripController(config, glamourerIpc, gearDropController, log);
 
-        mainWindow = new MainWindow(config, this, clientState, log);
+        mainWindow = new MainWindow(config, this, clientState, koStripController, log);
         debugOverlay = new RagdollDebugOverlay(this, mainWindow, config, gameGui);
 
         // Wire death events
@@ -113,6 +122,8 @@ public sealed class RagdollSystemPlugin : IDalamudPlugin
         DeactivateAll();
 
         deathDetector.Dispose();
+        koStripController.Dispose();
+        gearDropController.Dispose();
         mainWindow.Dispose();
         movementBlockHook.Dispose();
         boneTransformService.Dispose();
@@ -171,6 +182,8 @@ public sealed class RagdollSystemPlugin : IDalamudPlugin
             {
                 // Use elapsed tracked internally; we track separately for player too
             }
+
+            koStripController.Tick(1.0f / 60.0f);
         }
         catch (Exception ex)
         {
@@ -187,6 +200,7 @@ public sealed class RagdollSystemPlugin : IDalamudPlugin
         playerRagdoll?.Dispose();
         playerRagdoll = new RagdollController(boneTransformService, movementBlockHook, config, log);
         playerRagdoll.Activate(address);
+        koStripController.StripOnKo(address);
     }
 
     private void OnPlayerRevive(nint address)
@@ -195,6 +209,8 @@ public sealed class RagdollSystemPlugin : IDalamudPlugin
         playerRagdoll?.Dispose();
         playerRagdoll = null;
         movementBlockHook.Reset();
+        koStripController.Reset();
+        gearDropController.RemoveAll();
         RestoreCharacterMotion(address);
     }
 
@@ -235,6 +251,8 @@ public sealed class RagdollSystemPlugin : IDalamudPlugin
         playerRagdoll?.Dispose();
         playerRagdoll = null;
         movementBlockHook.Reset();
+        koStripController.Reset();
+        gearDropController.RemoveAll();
 
         foreach (var controller in npcRagdolls.Values)
             controller.Dispose();

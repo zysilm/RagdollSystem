@@ -5,6 +5,7 @@
     <Description>Ragdoll physics on character death</Description>
     <IsPackable>false</IsPackable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <PackageLicenseExpression>MPL-2.0</PackageLicenseExpression>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="BepuPhysics" Version="2.5.0-beta.22" />

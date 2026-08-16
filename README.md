@@ -71,3 +71,7 @@ The build output lives at `RagdollSystem/bin/Release/RagdollSystem/`. The `relea
 
 - Physics powered by [BEPUphysics2](https://github.com/bepu/bepuphysics2) by Ross Nordby
 - Built on [Dalamud](https://github.com/goatcorp/Dalamud) by goatcorp
+
+## License
+
+Licensed under the [Mozilla Public License 2.0](LICENSE).

@@ -31,6 +31,7 @@ public unsafe class RagdollController : IDisposable
     // State
     private bool isActive;
     private nint targetCharacterAddress;
+    private uint targetEntityId;
     private Vector3 savedCharacterPosition;
     private bool followWasActive;
     private float elapsed;
@@ -331,6 +332,7 @@ public unsafe class RagdollController : IDisposable
 
         targetCharacterAddress = characterAddress;
         var gameObj = (FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)characterAddress;
+        targetEntityId = gameObj->EntityId;
         savedCharacterPosition = new Vector3(gameObj->Position.X, gameObj->Position.Y, gameObj->Position.Z);
         followWasActive = false;
         activationDelay = delayOverride ?? config.RagdollActivationDelay;
@@ -348,7 +350,7 @@ public unsafe class RagdollController : IDisposable
 
         // Restore animation speed. Death timelines can report 0 when physics starts;
         // on cleanup we need to hand control back to the game with motion enabled.
-        if (targetCharacterAddress != nint.Zero)
+        if (TargetObjectAlive())
         {
             try
             {
@@ -364,6 +366,7 @@ public unsafe class RagdollController : IDisposable
         }
 
         targetCharacterAddress = nint.Zero;
+        targetEntityId = 0;
         followWasActive = false;
         physicsStarted = false;
         ragdollBoneIndices.Clear();
@@ -399,6 +402,17 @@ public unsafe class RagdollController : IDisposable
             log.Error(ex, "RagdollController: Error in render frame");
             Deactivate();
         }
+    }
+
+    private bool TargetObjectAlive()
+    {
+        if (targetCharacterAddress == nint.Zero) return false;
+        foreach (var gameObject in Services.ObjectTable)
+        {
+            if (gameObject.Address == targetCharacterAddress)
+                return targetEntityId == 0 || gameObject.EntityId == targetEntityId;
+        }
+        return false;
     }
 
     // --- Coordinate conversion ---
@@ -1556,7 +1570,7 @@ public unsafe class RagdollController : IDisposable
                 1.0f / 60.0f);
         }
 
-        if (config.RagdollFollowPosition && movementBlockHook != null && ragdollBones.Count > 0 && targetCharacterAddress != nint.Zero)
+        if (config.RagdollFollowPosition && movementBlockHook != null && ragdollBones.Count > 0 && TargetObjectAlive())
         {
             try
             {

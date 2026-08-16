@@ -1,6 +1,6 @@
 <Project Sdk="Dalamud.NET.Sdk/15.0.0">
   <PropertyGroup>
-    <Version>2.0.0</Version>
+    <Version>2.8.0.0</Version>
     <Authors>zysilm</Authors>
     <Description>Ragdoll physics on character death</Description>
     <IsPackable>false</IsPackable>
@@ -12,5 +12,7 @@
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="Resources\BuiltInBoneProfiles.json" />
+    <EmbeddedResource Include="Resources\CharacterSurfaceProfiles.json" />
+    <EmbeddedResource Include="Resources\CollapseProfiles\*.json" />
   </ItemGroup>
 </Project>

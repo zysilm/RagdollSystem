@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 using System;
 using System.Collections.Generic;
 using System.Numerics;
@@ -61,11 +65,16 @@ public unsafe class BoneTransformService : IDisposable
     public SkeletonAccess? TryGetSkeleton(nint characterAddress)
     {
         if (characterAddress == nint.Zero) return null;
-
         var gameObj = (GameObject*)characterAddress;
         if (gameObj->DrawObject == null) return null;
+        return TryGetSkeletonFromCharBase((CharacterBase*)gameObj->DrawObject);
+    }
 
-        var charBase = (CharacterBase*)gameObj->DrawObject;
+    /// <summary>Build skeleton access directly from a draw object's CharacterBase (e.g. a weapon's
+    /// own draw object, which has its own skeleton). Null if the pose isn't readable.</summary>
+    public SkeletonAccess? TryGetSkeletonFromCharBase(CharacterBase* charBase)
+    {
+        if (charBase == null) return null;
         var skeleton = charBase->Skeleton;
         if (skeleton == null || skeleton->PartialSkeletonCount < 1) return null;
 
@@ -89,7 +98,85 @@ public unsafe class BoneTransformService : IDisposable
     }
 
     /// <summary>
+    /// Apply bone rotation deltas to ModelPose with descendant propagation.
+    /// Preserves physics by never touching LocalPose.
+    /// Returns modification result for further processing (head follow, partial skeleton propagation).
+    /// </summary>
+    public BoneModificationResult ApplyRotationDeltas(
+        SkeletonAccess skel,
+        Dictionary<int, Quaternion> deltas,
+        HashSet<int>? skipBones = null)
+    {
+        var pose = skel.Pose;
+        var havokSkel = skel.HavokSkeleton;
+        var boneCount = skel.BoneCount;
+        var parentCount = skel.ParentCount;
+
+        var result = new BoneModificationResult(boneCount);
+
+        // Save original ModelPose before any modifications
+        for (int i = 0; i < boneCount; i++)
+        {
+            ref var m = ref pose->ModelPose.Data[i];
+            result.OriginalPositions[i] = new Vector3(m.Translation.X, m.Translation.Y, m.Translation.Z);
+            result.OriginalRotations[i] = new Quaternion(m.Rotation.X, m.Rotation.Y, m.Rotation.Z, m.Rotation.W);
+        }
+
+        for (int i = 0; i < boneCount && i < parentCount; i++)
+        {
+            if (skipBones != null && skipBones.Contains(i)) continue;
+
+            var parentIdx = (i > 0) ? havokSkel->ParentIndices[i] : (short)-1;
+            bool hasDirect = deltas.TryGetValue(i, out var directDelta);
+            bool parentHasAcc = parentIdx >= 0 && parentIdx < boneCount && result.HasAccumulated[parentIdx];
+
+            if (!hasDirect && !parentHasAcc) continue;
+
+            var newRot = result.OriginalRotations[i];
+            var newPos = result.OriginalPositions[i];
+
+            // Propagate parent's accumulated delta (rotate around parent's ORIGINAL pivot)
+            if (parentHasAcc)
+            {
+                var parentOrigPos = result.OriginalPositions[parentIdx];
+                var pDelta = result.AccumulatedDeltas[parentIdx];
+
+                var relPos = result.OriginalPositions[i] - parentOrigPos;
+                relPos = Vector3.Transform(relPos, pDelta);
+                newPos = parentOrigPos + relPos;
+
+                // Add parent's actual displacement
+                ref var parentModel = ref pose->ModelPose.Data[parentIdx];
+                var parentNewPos = new Vector3(parentModel.Translation.X, parentModel.Translation.Y, parentModel.Translation.Z);
+                newPos += parentNewPos - parentOrigPos;
+
+                newRot = Quaternion.Normalize(pDelta * newRot);
+            }
+
+            // Apply direct delta (local-space, right-multiply)
+            if (hasDirect)
+                newRot = Quaternion.Normalize(newRot * directDelta);
+
+            result.AccumulatedDeltas[i] = Quaternion.Normalize(newRot * Quaternion.Inverse(result.OriginalRotations[i]));
+            result.HasAccumulated[i] = true;
+
+            // Write back to ModelPose
+            ref var model = ref pose->ModelPose.Data[i];
+            model.Translation.X = newPos.X;
+            model.Translation.Y = newPos.Y;
+            model.Translation.Z = newPos.Z;
+            model.Rotation.X = newRot.X;
+            model.Rotation.Y = newRot.Y;
+            model.Rotation.Z = newRot.Z;
+            model.Rotation.W = newRot.W;
+        }
+
+        return result;
+    }
+
+    /// <summary>
     /// Write a bone's ModelPose transform directly and update accumulated delta tracking.
+    /// Use this for custom bone handling (e.g., head follow modes).
     /// </summary>
     public void WriteBoneTransform(
         SkeletonAccess skel,
@@ -98,6 +185,13 @@ public unsafe class BoneTransformService : IDisposable
         Quaternion newRot,
         BoneModificationResult result)
     {
+        if (boneIndex < 0 ||
+            boneIndex >= skel.BoneCount ||
+            boneIndex >= result.OriginalRotations.Length ||
+            boneIndex >= result.AccumulatedDeltas.Length ||
+            boneIndex >= result.HasAccumulated.Length)
+            return;
+
         ref var model = ref skel.Pose->ModelPose.Data[boneIndex];
         model.Translation.X = newPos.X;
         model.Translation.Y = newPos.Y;
@@ -167,6 +261,29 @@ public unsafe class BoneTransformService : IDisposable
         }
     }
 
+    /// <summary>
+    /// Every bone on a character's skeleton, in skeleton order. The real thing, not a curated list —
+    /// so ears, tails, horns, whiskers and whatever else a race or a creature happens to carry are all
+    /// in here. Empty when the skeleton isn't readable.
+    /// </summary>
+    public IReadOnlyList<string> GetBoneNames(nint characterAddress)
+    {
+        var skel = TryGetSkeleton(characterAddress);
+        if (skel == null) return Array.Empty<string>();
+        var access = skel.Value;
+
+        var bones = access.HavokSkeleton->Bones;
+        var count = Math.Min(access.BoneCount, bones.Length);
+
+        var names = new List<string>(count);
+        for (int i = 0; i < count; i++)
+        {
+            var name = bones[i].Name.String;
+            if (!string.IsNullOrEmpty(name)) names.Add(name);
+        }
+        return names;
+    }
+
     /// <summary>Resolve a bone index by name. Returns -1 if not found.</summary>
     public int ResolveBoneIndex(SkeletonAccess skel, string boneName)
     {
@@ -178,6 +295,72 @@ public unsafe class BoneTransformService : IDisposable
             if (name == boneName) return i;
         }
         return -1;
+    }
+
+    /// <summary>
+    /// Get a bone's world-space position for any character by address and bone name.
+    /// Returns null if the skeleton is unavailable or the bone is not found.
+    /// </summary>
+    public Vector3? GetBoneWorldPos(nint characterAddress, string boneName)
+    {
+        if (characterAddress == nint.Zero) return null;
+        var skel = TryGetSkeleton(characterAddress);
+        if (skel == null) return null;
+        var ns = skel.Value;
+
+        var idx = ResolveBoneIndex(ns, boneName);
+        if (idx < 0 || idx >= ns.BoneCount) return null;
+
+        var skeleton = ns.CharBase->Skeleton;
+        if (skeleton == null) return null;
+
+        var skelPos = new Vector3(
+            skeleton->Transform.Position.X,
+            skeleton->Transform.Position.Y,
+            skeleton->Transform.Position.Z);
+        var skelRot = new Quaternion(
+            skeleton->Transform.Rotation.X,
+            skeleton->Transform.Rotation.Y,
+            skeleton->Transform.Rotation.Z,
+            skeleton->Transform.Rotation.W);
+
+        ref var mt = ref ns.Pose->ModelPose.Data[idx];
+        var modelPos = new Vector3(mt.Translation.X, mt.Translation.Y, mt.Translation.Z);
+        return skelPos + Vector3.Transform(modelPos, skelRot);
+    }
+
+    /// <summary>
+    /// Get a bone's world-space position AND rotation (skeleton transform composed with
+    /// the model-space bone pose). Null if the skeleton is unavailable or the bone is
+    /// not found.
+    /// </summary>
+    public (Vector3 Position, Quaternion Rotation)? GetBoneWorldTransform(nint characterAddress, string boneName)
+    {
+        if (characterAddress == nint.Zero) return null;
+        var skel = TryGetSkeleton(characterAddress);
+        if (skel == null) return null;
+        var ns = skel.Value;
+
+        var idx = ResolveBoneIndex(ns, boneName);
+        if (idx < 0 || idx >= ns.BoneCount) return null;
+
+        var skeleton = ns.CharBase->Skeleton;
+        if (skeleton == null) return null;
+
+        var skelPos = new Vector3(
+            skeleton->Transform.Position.X,
+            skeleton->Transform.Position.Y,
+            skeleton->Transform.Position.Z);
+        var skelRot = new Quaternion(
+            skeleton->Transform.Rotation.X,
+            skeleton->Transform.Rotation.Y,
+            skeleton->Transform.Rotation.Z,
+            skeleton->Transform.Rotation.W);
+
+        ref var mt = ref ns.Pose->ModelPose.Data[idx];
+        var modelPos = new Vector3(mt.Translation.X, mt.Translation.Y, mt.Translation.Z);
+        var modelRot = new Quaternion(mt.Rotation.X, mt.Rotation.Y, mt.Rotation.Z, mt.Rotation.W);
+        return (skelPos + Vector3.Transform(modelPos, skelRot), Quaternion.Normalize(skelRot * modelRot));
     }
 
     public void Dispose()
@@ -200,10 +383,10 @@ public unsafe struct SkeletonAccess
 /// <summary>Result of applying bone modifications. Contains originals and accumulated deltas for further processing.</summary>
 public class BoneModificationResult
 {
-    public readonly Vector3[] OriginalPositions;
-    public readonly Quaternion[] OriginalRotations;
-    public readonly Quaternion[] AccumulatedDeltas;
-    public readonly bool[] HasAccumulated;
+    public Vector3[] OriginalPositions;
+    public Quaternion[] OriginalRotations;
+    public Quaternion[] AccumulatedDeltas;
+    public bool[] HasAccumulated;
 
     public BoneModificationResult(int boneCount)
     {
@@ -211,5 +394,26 @@ public class BoneModificationResult
         OriginalRotations = new Quaternion[boneCount];
         AccumulatedDeltas = new Quaternion[boneCount];
         HasAccumulated = new bool[boneCount];
+    }
+
+    /// <summary>
+    /// Prepare this instance for reuse across frames without reallocating.
+    /// OriginalPositions/OriginalRotations are fully overwritten by the caller each frame,
+    /// and AccumulatedDeltas is only read where HasAccumulated is set, so only the
+    /// HasAccumulated flags need clearing. Grows the backing arrays if boneCount increased.
+    /// </summary>
+    public void Reset(int boneCount)
+    {
+        if (HasAccumulated.Length < boneCount)
+        {
+            OriginalPositions = new Vector3[boneCount];
+            OriginalRotations = new Quaternion[boneCount];
+            AccumulatedDeltas = new Quaternion[boneCount];
+            HasAccumulated = new bool[boneCount];
+        }
+        else
+        {
+            Array.Clear(HasAccumulated, 0, boneCount);
+        }
     }
 }

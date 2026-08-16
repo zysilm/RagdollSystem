@@ -10,6 +10,7 @@ public static class Services
     public static IObjectTable ObjectTable { get; private set; } = null!;
     public static IFramework Framework { get; private set; } = null!;
     public static IGameInteropProvider GameInterop { get; private set; } = null!;
+    public static IDataManager DataManager { get; private set; } = null!;
     public static IGameGui GameGui { get; private set; } = null!;
     public static IChatGui ChatGui { get; private set; } = null!;
     public static ICondition Condition { get; private set; } = null!;
@@ -21,6 +22,7 @@ public static class Services
         IObjectTable objectTable,
         IFramework framework,
         IGameInteropProvider gameInterop,
+        IDataManager dataManager,
         IGameGui gameGui,
         IChatGui chatGui,
         ICondition condition,
@@ -31,6 +33,7 @@ public static class Services
         ObjectTable = objectTable;
         Framework = framework;
         GameInterop = gameInterop;
+        DataManager = dataManager;
         GameGui = gameGui;
         ChatGui = chatGui;
         Condition = condition;

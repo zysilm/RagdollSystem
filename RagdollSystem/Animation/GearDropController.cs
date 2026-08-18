@@ -12,6 +12,7 @@ using BepuPhysics.Constraints;
 using BepuUtilities;
 using BepuUtilities.Memory;
 using RagdollSystem.Integration;
+using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Game.ClientState.Objects.Types;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game.Character;
@@ -7507,11 +7508,16 @@ public unsafe class GearDropController : IDisposable
     {
         try
         {
-            // Only touch the clone's draw-object memory while the session is alive. At logout
-            // and shutdown the game frees the draw objects before our cleanup runs, and the
-            // restore walk (GetKeptModel → Materials) on the freed model is an uncatchable AV
-            // — it produced a crash dump from exactly this line during HandleLoggedOut.
-            var worldAlive = Core.Services.ObjectTable.LocalPlayer != null;
+            // Only touch the clone's draw-object memory while the session is alive and no zone
+            // transition is tearing down local objects. At logout/shutdown, and during a
+            // territory change (teleport/return), the game frees draw objects out from under us
+            // before our cleanup runs, and the restore walk (GetKeptModel → Materials) on the
+            // freed model is an uncatchable AV — it produced a crash dump from exactly this line
+            // during HandleLoggedOut, and again via TaskManager.ExecuteAllTasks after a
+            // mid-ragdoll territory change (BetweenAreas wasn't checked).
+            var worldAlive = Core.Services.ObjectTable.LocalPlayer != null
+                && !Core.Services.Condition[ConditionFlag.BetweenAreas]
+                && !Core.Services.Condition[ConditionFlag.BetweenAreas51];
             if (worldAlive)
             {
                 // Put the nulled model/material pointers back so the game's destructor frees them.

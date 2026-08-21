@@ -8029,8 +8029,14 @@ public unsafe partial class RagdollController : IDisposable
         // address now points at an unrelated character with a different EntityId. Without this,
         // we would freeze that newcomer's animation and overwrite its bones with our ragdoll
         // pose. Deactivate cleanly instead (restores nothing — the original target is gone).
-        if (targetCharacterAddress == nint.Zero ||
-            ((FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)targetCharacterAddress)->EntityId != targetEntityId)
+        // Must go through TargetObjectAlive() (object-table scan), not a direct pointer
+        // dereference: during a territory change the corpse's memory can already be freed
+        // before TerritoryChanged fires, and a freed object's memory often still reads back
+        // its stale EntityId — a pointer-based check happily passes, and the subsequent
+        // `character->Timeline.OverallSpeed = 0f` write below then corrupts whatever heap
+        // allocation now occupies that address (an uncatchable AV, surfacing several frames
+        // later in unrelated engine code).
+        if (!TargetObjectAlive())
         {
             log.Info("RagdollController: target despawned or slot reused; deactivating.");
             animationFrozen = false; // do not write OverallSpeed onto whatever now occupies the slot

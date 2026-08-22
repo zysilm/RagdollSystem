@@ -55,6 +55,15 @@ public unsafe class GearDropController : IDisposable
     private const uint CloneSlotEndExclusive = 249;
     private const int ReservedPlayerCloneSlots = 16; // headroom for a full KO strip (up to 7 gear) + PC dismember
     private const int CloneSlotReuseCooldownFrames = 30;
+    // Armed clones are native GameObjects that can't be safely touched/deleted mid zone-transition
+    // (the game's own teardown of local actors during a territory change can crash on them
+    // regardless of what our own cleanup code does or doesn't touch — a race in the engine, not
+    // something we can fully synchronize around). Auto-expiring them well before a player would
+    // typically get around to teleporting/leaving a duty shrinks that exposure window a lot, even
+    // though it can't close it entirely. Duration is user-configurable (Configuration.
+    // KoStripCloneAutoExpireSeconds) since it trades that safety margin against how long the
+    // dropped-gear effect stays visible.
+    private const float CloneAutoExpireFadeFraction = 0.25f; // fade out over the final quarter of the lifetime
     private const float GearGroundClearance = 0.012f;
     private const float GearHatGroundClearance = 0.024f;
     private const float GearGroundVisualSkin = 0.006f;
@@ -224,6 +233,7 @@ public unsafe class GearDropController : IDisposable
         public int FramesWaited;
         public int SettleFrames;   // let the clone idle into a real pose before freezing
         public bool Armed;         // frozen + body created + driving
+        public float ArmedElapsed; // wall-clock seconds since Armed went true (see CloneAutoExpireSeconds)
         public int LimbIndex = -1;
         public Vector3 LimbRootModelPos;
         public List<(int Idx, Vector3 T, Quaternion R, Vector3 S)>? LimbSnapshot; // frozen limb pose
@@ -482,6 +492,16 @@ public unsafe class GearDropController : IDisposable
     private readonly List<Clone> clones = new();
     private readonly List<Pending> pending = new();
     private readonly HashSet<int> allocatedIndices = new();
+
+    /// <summary>Diagnostics only (crash investigation): live clone / pending-spawn / deferred-despawn counts.</summary>
+    public (int Clones, int Pending, int DeferredDespawns) DiagCounts =>
+        (clones.Count, pending.Count, deferredNativeDespawns.Count);
+    // Clones whose native teardown (restore hidden pointers, delete the actor) had to be
+    // postponed because it wasn't safe to touch draw-object memory at despawn time (zone
+    // transition in progress). Retried each frame from OnRenderFrame once safe again — see
+    // DespawnClone. Their allocatedIndices entry is deliberately kept until then so the slot
+    // can't be handed to a new clone while the old one is still actually alive in the object table.
+    private readonly List<Clone> deferredNativeDespawns = new();
 
     private static readonly string[] BodyGearHandoffBones =
     {
@@ -812,6 +832,16 @@ public unsafe class GearDropController : IDisposable
             frameDt = Math.Clamp(elapsed, MinFrameDt, MaxFrameDt);
 
             TickCloneSlotCooldowns();
+            ProcessDeferredNativeDespawns();
+
+            // Everything below reads/writes clone and source-character native memory (skeletons,
+            // model poses, draw objects) every frame. During a zone transition (BetweenAreas) the
+            // game can be tearing that memory down out from under us at any point before
+            // TerritoryChanged fires and our own cleanup runs — so pause the whole clone
+            // pipeline (spawns, physics stepping, per-clone update) rather than touch it. Nothing
+            // here is time-critical to run exactly on schedule: pending delays, the physics
+            // accumulator, and clone state are all just left as-is and pick back up once safe.
+            if (!WorldSafeForNativeTouch()) return;
 
             // Tick pending spawns (delay countdown).
             for (int i = pending.Count - 1; i >= 0; i--)
@@ -3342,6 +3372,23 @@ public unsafe class GearDropController : IDisposable
     private bool UpdateClone(Clone c)
     {
         if (c.Chara == null) return false;
+
+        if (c.Armed && config.KoStripCloneAutoExpireEnabled)
+        {
+            c.ArmedElapsed += frameDt;
+            var duration = MathF.Max(1f, config.KoStripCloneAutoExpireSeconds);
+            if (c.ArmedElapsed >= duration)
+                return false; // auto-expire — see Configuration.KoStripCloneAutoExpireEnabled
+
+            // Fade out over the final quarter of the lifetime instead of popping out of existence.
+            var fadeStart = duration * (1f - CloneAutoExpireFadeFraction);
+            if (c.ArmedElapsed >= fadeStart)
+            {
+                var fadeT = (c.ArmedElapsed - fadeStart) / (duration - fadeStart);
+                ((Character*)c.Chara)->Alpha = 1f - Math.Clamp(fadeT, 0f, 1f);
+            }
+        }
+
         var drawObj = ((GameObject*)c.Chara)->DrawObject;
         if (drawObj == null) return !c.Armed;
         ApplyCloneDrawScale(c, drawObj);
@@ -7504,27 +7551,47 @@ public unsafe class GearDropController : IDisposable
         return -1;
     }
 
+    // Restore the clone's nulled model/material pointers (so the game's destructor frees them)
+    // and delete the actor. Only safe to call while the session is alive and no zone transition
+    // is tearing down local objects — callers must check worldAlive first.
+    private void FinishNativeDespawn(Clone c)
+    {
+        if (c.GearHiddenMaterials != null) RestoreHiddenMaterials(c);
+        if (c.GearHiddenModels != null) RestoreHiddenModels(c);
+
+        var clientObjMgr = ClientObjectManager.Instance();
+        if (clientObjMgr != null && c.ObjectIndex >= 0)
+        {
+            if (c.Chara != null) ((GameObject*)c.Chara)->DisableDraw();
+            clientObjMgr->DeleteObjectByIndex((ushort)c.ObjectIndex, 0);
+        }
+    }
+
+    private static bool WorldSafeForNativeTouch() =>
+        Core.Services.ObjectTable.LocalPlayer != null
+        && !Core.Services.Condition[ConditionFlag.BetweenAreas]
+        && !Core.Services.Condition[ConditionFlag.BetweenAreas51];
+
+    /// <summary>Retries native teardown for clones deferred by DespawnClone. Called every frame.</summary>
+    private void ProcessDeferredNativeDespawns()
+    {
+        if (deferredNativeDespawns.Count == 0 || !WorldSafeForNativeTouch()) return;
+
+        foreach (var c in deferredNativeDespawns)
+        {
+            try { FinishNativeDespawn(c); }
+            catch (Exception ex) { log.Warning(ex, $"Dismember: deferred despawn clone idx={c.ObjectIndex} failed"); }
+            allocatedIndices.Remove(c.ObjectIndex);
+            CooldownCloneSlot(c.ObjectIndex);
+        }
+        deferredNativeDespawns.Clear();
+    }
+
     private void DespawnClone(Clone c)
     {
+        var deferred = false;
         try
         {
-            // Only touch the clone's draw-object memory while the session is alive and no zone
-            // transition is tearing down local objects. At logout/shutdown, and during a
-            // territory change (teleport/return), the game frees draw objects out from under us
-            // before our cleanup runs, and the restore walk (GetKeptModel → Materials) on the
-            // freed model is an uncatchable AV — it produced a crash dump from exactly this line
-            // during HandleLoggedOut, and again via TaskManager.ExecuteAllTasks after a
-            // mid-ragdoll territory change (BetweenAreas wasn't checked).
-            var worldAlive = Core.Services.ObjectTable.LocalPlayer != null
-                && !Core.Services.Condition[ConditionFlag.BetweenAreas]
-                && !Core.Services.Condition[ConditionFlag.BetweenAreas51];
-            if (worldAlive)
-            {
-                // Put the nulled model/material pointers back so the game's destructor frees them.
-                if (c.GearHiddenMaterials != null) RestoreHiddenMaterials(c);
-                if (c.GearHiddenModels != null) RestoreHiddenModels(c);
-            }
-
             if (simulation != null)
             {
                 UnregisterPcCollisionBodies(c);
@@ -7562,20 +7629,39 @@ public unsafe class GearDropController : IDisposable
             c.GearRagdollRig = null;
             c.GearGarmentRig = null;
 
-            // Same session-alive gate for the actor itself.
-            var clientObjMgr = ClientObjectManager.Instance();
-            if (clientObjMgr != null && c.ObjectIndex >= 0 && worldAlive)
+            // Only touch the clone's draw-object memory (and delete the actor) while the session
+            // is alive and no zone transition is tearing down local objects. At logout/shutdown,
+            // and during a territory change (teleport/return), the game frees draw objects out
+            // from under us before our cleanup runs, and the restore walk (GetKeptModel →
+            // Materials) on the freed model is an uncatchable AV — it produced a crash dump from
+            // exactly this line during HandleLoggedOut, and again via TaskManager.ExecuteAllTasks
+            // after a mid-ragdoll territory change. If it's unsafe right now, defer the native
+            // teardown to a later, safe frame (ProcessDeferredNativeDespawns, drained from
+            // OnRenderFrame) instead of abandoning the actor outright — leaving it
+            // undeleted-but-forgotten orphans a half-torn-down GameObject in the object table
+            // indefinitely, which is its own delayed-crash hazard (e.g. another plugin's resource
+            // reload later touching its nulled model/material slots).
+            if (!WorldSafeForNativeTouch())
             {
-                if (c.Chara != null) ((GameObject*)c.Chara)->DisableDraw();
-                clientObjMgr->DeleteObjectByIndex((ushort)c.ObjectIndex, 0);
+                deferred = true;
+                deferredNativeDespawns.Add(c);
+                return;
             }
+
+            FinishNativeDespawn(c);
         }
         catch (Exception ex)
         {
             log.Warning(ex, $"Dismember: despawn clone idx={c.ObjectIndex} failed");
         }
-        allocatedIndices.Remove(c.ObjectIndex);
-        CooldownCloneSlot(c.ObjectIndex);
+        finally
+        {
+            if (!deferred)
+            {
+                allocatedIndices.Remove(c.ObjectIndex);
+                CooldownCloneSlot(c.ObjectIndex);
+            }
+        }
     }
 
     private (StaticHandle, TypedIndex) CreateTerrainPatch(float centerX, float centerZ, float aboveY)

@@ -1,6 +1,6 @@
 <Project Sdk="Dalamud.NET.Sdk/15.0.0">
   <PropertyGroup>
-    <Version>2.8.0.2</Version>
+    <Version>2.8.0.3</Version>
     <Authors>zysilm</Authors>
     <Description>Ragdoll physics on character death</Description>
     <IsPackable>false</IsPackable>

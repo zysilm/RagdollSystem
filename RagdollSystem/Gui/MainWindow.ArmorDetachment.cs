@@ -86,6 +86,36 @@ public partial class MainWindow
                              "into independent left/right pieces. Body and Legs remain work in progress: their\n" +
                              "equipment models can bake in body skin, which is filtered by material path.");
 
+        ImGui.Spacing();
+        var cloneAutoExpire = config.KoStripCloneAutoExpireEnabled;
+        if (ImGui.Checkbox("Auto-recycle dropped pieces##armordetachautoexpire", ref cloneAutoExpire))
+        {
+            config.KoStripCloneAutoExpireEnabled = cloneAutoExpire;
+            config.Save();
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Fade out and remove dropped/detached pieces a fixed time after they settle,\n" +
+                             "instead of leaving them until you revive or change zones.");
+
+        ImGui.BeginDisabled(!config.KoStripCloneAutoExpireEnabled);
+        var cloneAutoExpireSeconds = config.KoStripCloneAutoExpireSeconds;
+        if (ImGui.SliderFloat("Recycle after##armordetachautoexpireseconds", ref cloneAutoExpireSeconds, 2f, 30f, "%.1f s"))
+        {
+            config.KoStripCloneAutoExpireSeconds = cloneAutoExpireSeconds;
+            config.Save();
+        }
+        ImGui.EndDisabled();
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip("Fades out over the final quarter of this duration before being removed.");
+
+        if (!config.KoStripCloneAutoExpireEnabled || config.KoStripCloneAutoExpireSeconds > 15f)
+            ImGui.TextColored(new Vector4(1f, 0.75f, 0.2f, 1f),
+                "Warning: turning this off, or setting it long, raises the chance of a\n" +
+                "crash if you teleport / leave a duty while a dropped piece is still alive.\n" +
+                "This is a known game-side race, not something this plugin fully controls.");
+
+        ImGui.Separator();
+
         var advancedCloth = config.KoStripAdvancedClothPhysics;
         ImGui.BeginDisabled(!config.KoStripPhysicsDropClothing);
         if (ImGui.Checkbox("Advanced clothing settle##armordetachclothadvanced", ref advancedCloth))
@@ -390,6 +420,8 @@ public partial class MainWindow
             config.KoStripSyncWithRagdoll = false;
             config.KoStripPhysicsDrop = true;
             config.KoStripPhysicsDropClothing = true;
+            config.KoStripCloneAutoExpireEnabled = true;
+            config.KoStripCloneAutoExpireSeconds = Configuration.KoStripCloneAutoExpireSecondsDefault;
             config.KoStripAdvancedClothPhysics = true;
             config.KoStripGarmentTubeModel = false;
             config.KoStripGarmentFollowsBody = true;

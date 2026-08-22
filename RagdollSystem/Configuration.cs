@@ -347,6 +347,16 @@ public class Configuration : IPluginConfiguration
     // baked into those equipment models, so it remains opt-in.
     public bool KoStripPhysicsDropClothing { get; set; } = true;
 
+    // Dropped gear pieces are native game-object "clones" that the engine can crash on if a zone
+    // transition (teleport / leaving a duty) happens while one is still alive — a race in the
+    // engine's own teardown of local actors, not something this plugin can fully synchronize
+    // around. Auto-expiring them well before a player would typically move on shrinks that
+    // exposure window a lot. Turning this off, or setting a long duration, brings the crash risk
+    // back — the GUI warns about this next to the controls.
+    public bool KoStripCloneAutoExpireEnabled { get; set; } = true;
+    public const float KoStripCloneAutoExpireSecondsDefault = 2f;
+    public float KoStripCloneAutoExpireSeconds { get; set; } = KoStripCloneAutoExpireSecondsDefault;
+
     // Garment polish layered on top of clothing physics drop: short visual body follow, body/ground
     // friction damping, and delayed cloth collapse.
     public bool KoStripAdvancedClothPhysics { get; set; } = true;

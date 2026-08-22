@@ -8,6 +8,7 @@ using RagdollSystem.Game;
 using RagdollSystem.Gui;
 using RagdollSystem.Integration;
 using RagdollSystem.Safety;
+using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Game.Command;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
@@ -44,6 +45,14 @@ public sealed class RagdollSystemPlugin : IDalamudPlugin
     private readonly Dictionary<nint, RagdollController> npcRagdolls = new();
     // Track activation time for auto-cleanup
     private readonly Dictionary<nint, float> npcRagdollTimers = new();
+
+    // --- Crash investigation diagnostics (temporary) ---
+    // After a territory change, log how Condition[BetweenAreas]/[BetweenAreas51] and clone/pending
+    // state actually evolve frame-by-frame across the window where past crashes have landed
+    // (roughly 2-4s after the event). Gating cleanup on those flags assumes they stay true for the
+    // whole dangerous window; this instrumentation checks that assumption instead of guessing again.
+    private int territoryDiagFramesLeft;
+    private int territoryDiagFrameCounter;
 
     public RagdollSystemPlugin(
         IDalamudPluginInterface pluginInterface,
@@ -184,6 +193,22 @@ public sealed class RagdollSystemPlugin : IDalamudPlugin
             }
 
             koStripController.Tick(1.0f / 60.0f);
+
+            if (territoryDiagFramesLeft > 0)
+            {
+                territoryDiagFramesLeft--;
+                // ~6 frames apart at 60fps ≈ every 0.1s.
+                if (territoryDiagFrameCounter++ % 6 == 0)
+                {
+                    var (cClones, cPending, cDeferred) = gearDropController.DiagCounts;
+                    log.Info($"[TerritoryDiag] t-{300 - territoryDiagFramesLeft} " +
+                        $"BetweenAreas={Core.Services.Condition[ConditionFlag.BetweenAreas]} " +
+                        $"BetweenAreas51={Core.Services.Condition[ConditionFlag.BetweenAreas51]} " +
+                        $"LocalPlayer={(Core.Services.ObjectTable.LocalPlayer != null ? "alive" : "null")} " +
+                        $"playerRagdoll={(playerRagdoll == null ? "null" : playerRagdoll.IsActive ? "active" : "inactive")} " +
+                        $"clones={cClones} pending={cPending} deferred={cDeferred}");
+                }
+            }
         }
         catch (Exception ex)
         {
@@ -263,6 +288,14 @@ public sealed class RagdollSystemPlugin : IDalamudPlugin
     private void OnTerritoryChanged(uint territoryId)
     {
         log.Info($"Territory changed to {territoryId} — deactivating all ragdolls.");
+        var (cClones, cPending, cDeferred) = gearDropController.DiagCounts;
+        log.Info($"[TerritoryDiag] t-0 BetweenAreas={Core.Services.Condition[ConditionFlag.BetweenAreas]} " +
+            $"BetweenAreas51={Core.Services.Condition[ConditionFlag.BetweenAreas51]} " +
+            $"LocalPlayer={(Core.Services.ObjectTable.LocalPlayer != null ? "alive" : "null")} " +
+            $"playerRagdoll={(playerRagdoll == null ? "null" : playerRagdoll.IsActive ? "active" : "inactive")} " +
+            $"clones={cClones} pending={cPending} deferred={cDeferred}");
+        territoryDiagFramesLeft = 300; // ~5s at 60fps
+        territoryDiagFrameCounter = 0;
         DeactivateAll();
         deathDetector.Reset();
     }

@@ -277,7 +277,7 @@ public unsafe partial class RagdollController
         try
         {
             if (targetCharacterAddress != nint.Zero &&
-                Core.Services.ObjectTable.LocalPlayer != null &&
+                WorldSafeForCharacterWrite() &&
                 boneService.TryGetSkeleton(targetCharacterAddress) is { } skel)
             {
                 RestoreSquashScales(skel);

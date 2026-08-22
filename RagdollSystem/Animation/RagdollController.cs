@@ -17,6 +17,7 @@ using BepuPhysics.CollisionDetection;
 using BepuPhysics.Constraints;
 using BepuUtilities;
 using BepuUtilities.Memory;
+using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using FFXIVClientStructs.FFXIV.Client.Game.Object;
@@ -2791,9 +2792,10 @@ public unsafe partial class RagdollController : IDisposable
         // (not physicsStarted) so a freeze that happened during a FAILED InitializePhysics
         // is still undone — otherwise the corpse would be stuck at OverallSpeed=0 forever,
         // and a later re-Activate would save that 0 as the "original" speed (sticky freeze).
-        // Skip the character write during game shutdown — the actor is already freed then and the
-        // write would crash (this runs from Dispose on game close). LocalPlayer null => closing.
-        if (targetCharacterAddress != nint.Zero && animationFrozen && Core.Services.ObjectTable.LocalPlayer != null)
+        // Skip the character write during game shutdown or a territory change — the actor's
+        // memory is already freed/being freed then and the write would crash. See
+        // WorldSafeForCharacterWrite for why LocalPlayer non-null alone isn't enough.
+        if (targetCharacterAddress != nint.Zero && animationFrozen && WorldSafeForCharacterWrite())
         {
             try
             {
@@ -2817,7 +2819,7 @@ public unsafe partial class RagdollController : IDisposable
         // re-syncs it from the (never-moved) logical position on revive. NPC phantoms are left
         // as-is (they despawn or are repositioned elsewhere), matching the prior behaviour.
 #if DEV_EXPERIMENTAL
-        if (followWasActive && targetCharacterAddress != nint.Zero && Core.Services.ObjectTable.LocalPlayer != null)
+        if (followWasActive && targetCharacterAddress != nint.Zero && WorldSafeForCharacterWrite())
         {
             try
             {
@@ -8020,6 +8022,18 @@ public unsafe partial class RagdollController : IDisposable
         }
         return false;
     }
+
+    /// <summary>
+    /// True when it's safe to write into a live character's native memory (animation speed,
+    /// bone scale, etc.). LocalPlayer being non-null alone isn't enough — during a territory
+    /// change the game tears down local actors' draw objects while LocalPlayer stays non-null,
+    /// and writing into that freed/reallocated memory is an uncatchable AV that only manifests
+    /// several frames later in unrelated engine code. Also gate on BetweenAreas/BetweenAreas51.
+    /// </summary>
+    private static bool WorldSafeForCharacterWrite() =>
+        Core.Services.ObjectTable.LocalPlayer != null
+        && !Core.Services.Condition[ConditionFlag.BetweenAreas]
+        && !Core.Services.Condition[ConditionFlag.BetweenAreas51];
 
     private void StepAndApply(float dt)
     {
